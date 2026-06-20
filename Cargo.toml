@@ -5,3 +5,8 @@ edition = "2024"
 
 [dependencies]
 clap = { version = "4.4", features = ["derive"] }
+walkdir = "2.4"
+ignore = "0.4"
+indicatif = "0.17"
+colored = "2.1"
+anyhow = "1.0"
