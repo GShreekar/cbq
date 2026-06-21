@@ -1,6 +1,7 @@
 pub mod cli;
 pub mod services;
 pub mod db;
+pub mod config;
 
 use std::time::Duration;
 use clap::Parser;
@@ -232,6 +233,76 @@ fn main() {
         }
         Some(Commands::Search { query, limit }) => {
             run_search(&query, limit);
+        }
+        Some(Commands::Config { action }) => {
+            match action {
+                cli::args::ConfigAction::Init => {
+                    let path = config::settings::get_config_path().unwrap();
+                    let default_conf = config::settings::Config::default();
+                    if let Err(e) = config::settings::save_config(&default_conf) {
+                        eprintln!("Failed to save config: {}", e);
+                    } else {
+                        println!("Created {} with defaults", path.to_string_lossy());
+                    }
+                }
+                cli::args::ConfigAction::Get => {
+                    match config::settings::load_config() {
+                        Ok(conf) => {
+                            let toml_str = toml::to_string(&conf).unwrap();
+                            println!("{}", toml_str);
+                        }
+                        Err(e) => eprintln!("Failed to load config: {}", e),
+                    }
+                }
+                cli::args::ConfigAction::Set { key, value } => {
+                    let mut conf = match config::settings::load_config() {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("Failed to load config: {}", e);
+                            std::process::exit(1);
+                        }
+                    };
+
+                    match key.as_str() {
+                        "ollama.host" => conf.ollama.host = value,
+                        "ollama.port" => {
+                            if let Ok(v) = value.parse::<u16>() {
+                                conf.ollama.port = v;
+                            } else {
+                                eprintln!("Error: port must be an integer");
+                                std::process::exit(1);
+                            }
+                        }
+                        "ollama.embedding_model" => conf.ollama.embedding_model = value,
+                        "search.top_k" | "top_k" => {
+                            if let Ok(v) = value.parse::<usize>() {
+                                conf.search.top_k = v;
+                            } else {
+                                eprintln!("Error: top_k must be an integer");
+                                std::process::exit(1);
+                            }
+                        }
+                        "search.similarity_threshold" | "similarity_threshold" => {
+                            if let Ok(v) = value.parse::<f64>() {
+                                conf.search.similarity_threshold = v;
+                            } else {
+                                eprintln!("Error: similarity_threshold must be a float");
+                                std::process::exit(1);
+                            }
+                        }
+                        _ => {
+                            eprintln!("Unknown config key: '{}'", key);
+                            std::process::exit(1);
+                        }
+                    }
+
+                    if let Err(e) = config::settings::save_config(&conf) {
+                        eprintln!("Failed to save config: {}", e);
+                    } else {
+                        println!("{}", "✓ Updated config".green());
+                    }
+                }
+            }
         }
         None => {
             if let Some(query) = args.default_query {

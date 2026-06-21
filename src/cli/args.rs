@@ -44,4 +44,27 @@ pub enum Commands {
         #[arg(help = "The maximum number of results to display", short, long, default_value_t = 5)]
         limit: usize,
     },
+    #[command(about = "Manage global configuration settings")]
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigAction {
+    #[command(about = "Initialize default configuration file")]
+    Init,
+
+    #[command(about = "Display current configuration parameters")]
+    Get,
+
+    #[command(about = "Set a configuration parameter (e.g. search.top_k 10)")]
+    Set {
+        #[arg(help = "The config key path to set (e.g. search.top_k, ollama.host")]
+        key: String,
+
+        #[arg(help = "The value to set")]
+        value: String,
+    },
 }
