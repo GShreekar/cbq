@@ -23,10 +23,12 @@ pub struct Cli {
 pub enum Commands {
     #[command(about = "Initialize and index code files in a target directory")]
     Init {
-        #[arg(
-            help = "The target directory path to index",
-            default_value = "./"
-        )]
+        #[arg(help = "The target directory path to index", default_value = "./")]
+        path: PathBuf,
+    },
+    #[command(about = "Parse code files in a directory and print detected chunks")]
+    Parse {
+        #[arg(help = "The directory path to scan and parse", default_value = "./")]
         path: PathBuf,
     },
 }
