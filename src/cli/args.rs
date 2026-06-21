@@ -31,4 +31,9 @@ pub enum Commands {
         #[arg(help = "The directory path to scan and parse", default_value = "./")]
         path: PathBuf,
     },
+    #[command(about = "Index code files in a directory and save chunks to the database")]
+    Index {
+        #[arg(help = "The target directory path to index", default_value = "./")]
+        path: PathBuf,
+    },
 }
