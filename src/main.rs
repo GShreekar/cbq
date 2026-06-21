@@ -7,6 +7,7 @@ use clap::Parser;
 use cli::args::{Cli, Commands};
 use services::file_discovery::discover_files;
 use services::parser::parse_file;
+use services::vector_search::search_codebase;
 use db::schema::{get_db_path, init_db};
 use db::queries::{clear_chunks, insert_chunks, get_db_stats};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -229,12 +230,82 @@ fn main() {
                 }
             }
         }
+        Some(Commands::Search { query, limit }) => {
+            run_search(&query, limit);
+        }
         None => {
             if let Some(query) = args.default_query {
-                print!("Feature not yet implemented: {}", query);
+                run_search(&query, 5);
             } else {
                 println!("No arguments provided. Run with --help to see usage.");
             }
+        }
+    }
+}
+
+fn run_search(query: &str, limit: usize) {
+    let project_path = std::path::Path::new(".");
+    let db_path = match get_db_path(project_path) {
+        Ok(p) => p,
+        Err(err) => {
+            eprintln!("{} {}", "Database path error:".red().bold(), err);
+            std::process::exit(1);
+        }
+    };
+
+    if !db_path.exists() {
+        eprintln!(
+            "{} Database does not exist. Please index the workspace first using: {}",
+            "Error:".red().bold(),
+            "cargo run -- index .".yellow().bold()
+        );
+        std::process::exit(1);
+    }
+
+    let conn = match rusqlite::Connection::open(&db_path) {
+        Ok(c) => c,
+        Err(err) => {
+            eprintln!("{} Failed to open connection: {}", "Error:".red().bold(), err);
+            std::process::exit(1);
+        }
+    };
+
+    println!("Searching database for: '{}'...", query.cyan());
+
+    match search_codebase(&conn, query, limit) {
+        Ok(results) => {
+            if results.is_empty() {
+                println!("{}", "No relevant chunks found.".yellow());
+                return;
+            }
+
+            println!("\nFound {} relevant chunks:\n", results.len().to_string().yellow().bold());
+
+            for (idx, result) in results.iter().enumerate() {
+                println!(
+                    "{}. {} [Score: {:.2}]",
+                    (idx + 1).to_string().bold(),
+                    format!(
+                        "{}:{}-{}",
+                        result.chunk.file_path.display(),
+                        result.chunk.start_line,
+                        result.chunk.end_line
+                    ).magenta().underline(),
+                    result.score
+                );
+
+                for line in result.chunk.content.lines().take(5) {
+                    println!("   {}", line.dimmed());
+                }
+                if result.chunk.content.lines().count() > 5 {
+                    println!("   {}", "...".dimmed());
+                }
+                println!();
+            }
+        }
+        Err(err) => {
+            eprintln!("{} Search failed: {}", "Error:".red().bold(), err);
+            std::process::exit(1);
         }
     }
 }

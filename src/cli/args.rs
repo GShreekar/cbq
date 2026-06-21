@@ -36,4 +36,12 @@ pub enum Commands {
         #[arg(help = "The target directory path to index", default_value = "./")]
         path: PathBuf,
     },
+    #[command(about = "Search the indexed codebase using keywords")]
+    Search {
+        #[arg(help = "The question or term to search for")]
+        query: String,
+
+        #[arg(help = "The maximum number of results to display", short, long, default_value_t = 5)]
+        limit: usize,
+    },
 }
