@@ -2,6 +2,7 @@ pub mod cli;
 pub mod services;
 pub mod db;
 pub mod config;
+pub mod ui;
 
 use std::time::Duration;
 use clap::Parser;
@@ -195,16 +196,12 @@ fn main() {
 
             match get_db_stats(&conn) {
                 Ok(stats) => {
-                    println!("Database: {}", db_path.parent().unwrap().to_string_lossy().underline());
-                    println!("  - Chunks: {}", stats.total_chunks.to_string().bold());
+                    crate::ui::formatter::print_section("Database Index Statistics");
+                    println!("Location: {}", db_path.parent().unwrap().to_string_lossy().underline());
                     
-                    let mut lang_stmt = match conn.prepare("SELECT DISTINCT file_path FROM chunks") {
-                        Ok(s) => s,
-                        Err(e) => {
-                            eprintln!("Error querying languages: {}", e);
-                            return;
-                        }
-                    };
+                    let headers = vec!["Metric", "Value"];
+                    
+                    let mut lang_stmt = conn.prepare("SELECT DISTINCT file_path FROM chunks").unwrap();
                     let paths_iter = lang_stmt.query_map([], |row| row.get::<_, String>(0)).unwrap();
                     let mut languages = std::collections::HashSet::new();
                     for p_res in paths_iter {
@@ -217,14 +214,17 @@ fn main() {
                     }
                     let mut lang_vec: Vec<String> = languages.into_iter().collect();
                     lang_vec.sort();
-                    let lang_list = lang_vec.join(", ");
-                    println!("  - Languages: {} ({})", lang_vec.len(), lang_list.blue());
+                    
+                    let file_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+                    let file_size_mb = format!("{:.2} MB", file_size as f64 / 1024.0 / 1024.0);
 
-                    let file_size = std::fs::metadata(&db_path)
-                        .map(|m| m.len())
-                        .unwrap_or(0);
-                    let file_size_mb = file_size as f64 / 1024.0 / 1024.0;
-                    println!("  - Size: {:.2} MB", file_size_mb);
+                    let rows = vec![
+                        vec!["Total Code Chunks".to_string(), stats.total_chunks.to_string()],
+                        vec!["Distinct Languages".to_string(), format!("{} ({})", lang_vec.len(), lang_vec.join(", "))],
+                        vec!["Disk Footprint Size".to_string(), file_size_mb],
+                    ];
+                    
+                    crate::ui::formatter::print_table(&headers, &rows);
                 }
                 Err(err) => {
                     eprintln!("{} Failed to retrieve database statistics: {}", "Error:".red().bold(), err);
@@ -366,7 +366,8 @@ fn run_search(query: &str, limit: usize) {
                 );
 
                 for line in result.chunk.content.lines().take(5) {
-                    println!("   {}", line.dimmed());
+                    let highlighted = crate::ui::formatter::highlight_code(line);
+                    println!("   {}", highlighted);
                 }
                 if result.chunk.content.lines().count() > 5 {
                     println!("   {}", "...".dimmed());

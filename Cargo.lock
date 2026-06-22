@@ -813,6 +813,7 @@ dependencies = [
  "anyhow",
  "clap",
  "colored",
+ "console",
  "ignore",
  "indicatif",
  "rusqlite",
