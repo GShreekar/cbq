@@ -10,6 +10,7 @@ use cli::args::{Cli, Commands};
 use services::file_discovery::discover_files;
 use services::parser::parse_file;
 use services::vector_search::search_codebase;
+use services::chat_history::{save_chat, get_history, export_history_to_markdown};
 use db::schema::{get_db_path, init_db};
 use db::queries::{clear_chunks, insert_chunks, get_db_stats};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -304,6 +305,37 @@ fn main() {
                 }
             }
         }
+        Some(Commands::History) => {
+            match get_history() {
+                Ok(history) => {
+                    if history.is_empty() {
+                        println!("No search history found.");
+                        return;
+                    }
+                    crate::ui::formatter::print_section("Search Query History Log");
+                    for entry in history {
+                        println!(
+                            "{} - \"{}\" ({} matches)",
+                            entry.timestamp.dimmed(),
+                            entry.query.bold().yellow(),
+                            entry.results.len()
+                        );
+                    }
+                }
+                Err(err) => eprintln!("Failed to retrieve history: {}", err),
+            }
+        }
+        Some(Commands::Export) => {
+            match export_history_to_markdown() {
+                Ok(path) => {
+                    crate::ui::formatter::print_success_msg(&format!(
+                        "Exported search history to: {}",
+                        path.to_string_lossy().underline().yellow()
+                    ));
+                }
+                Err(err) => eprintln!("Failed to export history: {}", err),
+            }
+        }
         None => {
             if let Some(query) = args.default_query {
                 run_search(&query, 5);
@@ -373,6 +405,10 @@ fn run_search(query: &str, limit: usize) {
                     println!("   {}", "...".dimmed());
                 }
                 println!();
+            }
+
+            if let Err(e) = save_chat(query, &results) {
+                eprintln!("Warning: Failed to save search history: {}", e);
             }
         }
         Err(err) => {

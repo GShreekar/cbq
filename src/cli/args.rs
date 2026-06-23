@@ -49,6 +49,10 @@ pub enum Commands {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    #[command(about = "Display the history of search queries")]
+    History,
+    #[command(about = "Export all history logs to a Markdown file")]
+    Export,
 }
 
 #[derive(Subcommand, Debug)]
