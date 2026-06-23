@@ -11,12 +11,15 @@ use services::file_discovery::discover_files;
 use services::parser::parse_file;
 use services::vector_search::search_codebase;
 use services::chat_history::{save_chat, get_history, export_history_to_markdown};
+use services::ollama::{check_ollama_status, generate_embedding};
+use config::settings::load_config;
 use db::schema::{get_db_path, init_db};
 use db::queries::{clear_chunks, insert_chunks, get_db_stats};
 use indicatif::{ProgressBar, ProgressStyle};
 use colored::Colorize;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let args = Cli::parse();
 
     match args.command {
@@ -117,6 +120,29 @@ fn main() {
         Some(Commands::Index { path }) => {
             println!("Indexing {}...", path.display().to_string().cyan());
 
+            let config = match load_config() {
+                Ok(c) => c,
+                Err(_) => {
+                    let default_conf = crate::config::settings::Config::default();
+                    let _ = crate::config::settings::save_config(&default_conf);
+                    default_conf
+                }
+            };
+
+            println!("Checking Ollama connection...");
+            if !check_ollama_status(&config.ollama.host, config.ollama.port).await {
+                eprintln!(
+                    "{} Ollama service is not running at {}:{}",
+                    "Error:".red().bold(),
+                    config.ollama.host,
+                    config.ollama.port
+                );
+                std::process::exit(1);
+            }
+            println!("{} Connected", "✓".green().bold());
+            println!("Embedding model: {}", config.ollama.embedding_model.yellow().bold());
+            println!();
+
             let discovery = match discover_files(&path) {
                 Ok(res) => res,
                 Err(err) => {
@@ -124,18 +150,6 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-
-            let file_pb = ProgressBar::new(discovery.files.len() as u64);
-            file_pb.set_style(
-                ProgressStyle::with_template("[{bar:16.green}] {percent}% - {pos} files processed")
-                    .unwrap()
-                    .progress_chars("██░")
-            );
-            for _ in 0..discovery.files.len() {
-                file_pb.inc(1);
-            }
-            file_pb.finish();
-            println!();
 
             let db_path = match get_db_path(&path) {
                 Ok(p) => p,
@@ -182,13 +196,48 @@ fn main() {
             parse_pb.finish_with_message(format!("{} chunks found", all_chunks.len()));
             println!();
 
+            println!("Generating embeddings...");
+            let embed_pb = ProgressBar::new(all_chunks.len() as u64);
+            embed_pb.set_style(
+                ProgressStyle::with_template("[{bar:16.green}] {percent}% - {pos}/{len} embeddings generated")
+                    .unwrap()
+                    .progress_chars("██░")
+            );
+
+            let mut embeddings = Vec::new();
+            for chunk in &all_chunks {
+                match generate_embedding(
+                    &config.ollama.host,
+                    config.ollama.port,
+                    &config.ollama.embedding_model,
+                    &chunk.content,
+                ).await {
+                    Ok(emb) => {
+                        embeddings.push(emb);
+                    }
+                    Err(err) => {
+                        embed_pb.finish_and_clear();
+                        eprintln!(
+                            "\n{} Failed to generate embedding for chunk in {}: {}",
+                            "Error:".red().bold(),
+                            chunk.file_path.display(),
+                            err
+                        );
+                        std::process::exit(1);
+                    }
+                }
+                embed_pb.inc(1);
+            }
+            embed_pb.finish_with_message(format!("{} embeddings generated", embeddings.len()));
+            println!();
+
             println!("Saving to database...");
             if let Err(err) = clear_chunks(&conn) {
                 eprintln!("{} Failed to clear old database chunks: {}", "Error:".red().bold(), err);
                 std::process::exit(1);
             }
 
-            if let Err(err) = insert_chunks(&mut conn, &all_chunks) {
+            if let Err(err) = insert_chunks(&mut conn, &all_chunks, &embeddings) {
                 eprintln!("{} Failed to save chunks to database: {}", "Error:".red().bold(), err);
                 std::process::exit(1);
             }
@@ -233,7 +282,7 @@ fn main() {
             }
         }
         Some(Commands::Search { query, limit }) => {
-            run_search(&query, limit);
+            run_search(&query, limit).await;
         }
         Some(Commands::Config { action }) => {
             match action {
@@ -338,7 +387,7 @@ fn main() {
         }
         None => {
             if let Some(query) = args.default_query {
-                run_search(&query, 5);
+                run_search(&query, 5).await;
             } else {
                 println!("No arguments provided. Run with --help to see usage.");
             }
@@ -346,7 +395,26 @@ fn main() {
     }
 }
 
-fn run_search(query: &str, limit: usize) {
+async fn run_search(query: &str, limit: usize) {
+    let config = match load_config() {
+        Ok(c) => c,
+        Err(_) => {
+            let default_conf = crate::config::settings::Config::default();
+            let _ = crate::config::settings::save_config(&default_conf);
+            default_conf
+        }
+    };
+
+    if !check_ollama_status(&config.ollama.host, config.ollama.port).await {
+        eprintln!(
+            "{} Ollama service is not running at {}:{}",
+            "Error:".red().bold(),
+            config.ollama.host,
+            config.ollama.port
+        );
+        std::process::exit(1);
+    }
+
     let project_path = std::path::Path::new(".");
     let db_path = match get_db_path(project_path) {
         Ok(p) => p,
@@ -375,7 +443,20 @@ fn run_search(query: &str, limit: usize) {
 
     println!("Searching database for: '{}'...", query.cyan());
 
-    match search_codebase(&conn, query, limit) {
+    let query_vector = match generate_embedding(
+        &config.ollama.host,
+        config.ollama.port,
+        &config.ollama.embedding_model,
+        query,
+    ).await {
+        Ok(vec) => vec,
+        Err(err) => {
+            eprintln!("{} Failed to generate embedding for query: {}", "Error:".red().bold(), err);
+            std::process::exit(1);
+        }
+    };
+
+    match search_codebase(&conn, &query_vector, limit) {
         Ok(results) => {
             if results.is_empty() {
                 println!("{}", "No relevant chunks found.".yellow());

@@ -1,7 +1,6 @@
-use rusqlite::Connection;
-use std::path::PathBuf;
 use crate::services::chunker::CodeChunk;
-use crate::services::embeddings::get_search_tokens;
+use crate::services::embeddings::bytes_to_vector;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct SearchResult {
@@ -9,46 +8,84 @@ pub struct SearchResult {
     pub score: f64,
 }
 
-pub fn search_codebase(conn: &Connection, query: &str, top_k: usize) -> Result<Vec<SearchResult>, anyhow::Error> {
-    let query_tokens = get_search_tokens(query);
-    if query_tokens.is_empty() {
-        return Ok(Vec::new());
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
     }
+    let mut dot_product = 0.0;
+    let mut norm_a = 0.0;
+    let mut norm_b = 0.0;
+    for (val_a, val_b) in a.iter().zip(b.iter()) {
+        dot_product += val_a * val_b;
+        norm_a += val_a * val_a;
+        norm_b += val_b * val_b;
+    }
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return 0.0;
+    }
+    (dot_product / (norm_a.sqrt() * norm_b.sqrt())) as f64
+}
 
+pub fn search_codebase(
+    conn: &rusqlite::Connection,
+    query_vector: &[f32],
+    limit: usize,
+) -> Result<Vec<SearchResult>, anyhow::Error> {
     let mut stmt = conn.prepare(
-        "SELECT file_path, name, chunk_type, content, start_line, end_line FROM chunks"
+        "SELECT file_path, name, chunk_type, content, start_line, end_line, embedding FROM chunks"
     )?;
 
-    let chunk_rows = stmt.query_map([], |row| {
+    let chunk_iter = stmt.query_map([], |row| {
         let file_path_str: String = row.get(0)?;
-        Ok(CodeChunk {
-            file_path: PathBuf::from(file_path_str),
-            name: row.get(1)?,
-            chunk_type: row.get(2)?,
-            content: row.get(3)?,
-            start_line: row.get::<_, i64>(4)? as usize,
-            end_line: row.get::<_, i64>(5)? as usize,
-        })
+        let name: String = row.get(1)?;
+        let chunk_type: String = row.get(2)?;
+        let content: String = row.get(3)?;
+        let start_line: usize = row.get(4)?;
+        let end_line: usize = row.get(5)?;
+        let emb_bytes: Vec<u8> = row.get(6)?;
+
+        Ok((
+            CodeChunk {
+                file_path: PathBuf::from(file_path_str),
+                name,
+                chunk_type,
+                content,
+                start_line,
+                end_line,
+            },
+            emb_bytes,
+        ))
     })?;
 
     let mut results = Vec::new();
-    for chunk_res in chunk_rows {
-        let chunk = chunk_res?;
-        let chunk_tokens = get_search_tokens(&chunk.content);
-
-        let overlap_count = query_tokens
-            .iter()
-            .filter(|token| chunk_tokens.contains(*token))
-            .count();
-
-        if overlap_count > 0 {
-            let score = overlap_count as f64 / query_tokens.len() as f64;
+    for item in chunk_iter {
+        if let Ok((chunk, bytes)) = item {
+            let chunk_vector = bytes_to_vector(&bytes);
+            let score = cosine_similarity(query_vector, &chunk_vector);
             results.push(SearchResult { chunk, score });
         }
     }
 
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    results.truncate(limit);
 
-    results.truncate(top_k);
     Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cosine_similarity() {
+        let a = vec![1.0, 0.0, 0.0];
+        let b = vec![1.0, 0.0, 0.0];
+        assert!((cosine_similarity(&a, &b) - 1.0).abs() < 1e-6);
+
+        let c = vec![0.0, 1.0, 0.0];
+        assert!((cosine_similarity(&a, &c) - 0.0).abs() < 1e-6);
+
+        let d = vec![-1.0, 0.0, 0.0];
+        assert!((cosine_similarity(&a, &d) - (-1.0)).abs() < 1e-6);
+    }
 }

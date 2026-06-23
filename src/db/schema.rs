@@ -31,7 +31,8 @@ pub fn init_db(db_path: &Path) -> Result<Connection, anyhow::Error> {
             chunk_type TEXT NOT NULL,
             content TEXT NOT NULL,
             start_line INTEGER NOT NULL,
-            end_line INTEGER NOT NULL
+            end_line INTEGER NOT NULL,
+            embedding BLOB
         )",
         [],
     )?;
