@@ -55,6 +55,8 @@ pub enum Commands {
     Export,
     #[command(about = "Start an interactive chat session to query the codebase")]
     Chat,
+    #[command(about = "Analyze git diffs from stdin to show impact analysis")]
+    Analyze,
 }
 
 #[derive(Subcommand, Debug)]

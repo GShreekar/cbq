@@ -12,6 +12,7 @@ use services::parser::parse_file;
 use services::vector_search::search_codebase;
 use services::chat_history::{save_chat, get_history, export_history_to_markdown};
 use services::ollama::{check_ollama_status, generate_embedding};
+use services::git::parse_diff;
 use config::settings::load_config;
 use db::schema::{get_db_path, init_db};
 use db::queries::{clear_chunks, insert_chunks, get_db_stats};
@@ -391,6 +392,12 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Some(Commands::Analyze) => {
+            if let Err(err) = run_analyze().await {
+                eprintln!("{} Analysis failed: {}", "Error:".red().bold(), err);
+                std::process::exit(1);
+            }
+        }
         None => {
             if let Some(query) = args.default_query {
                 run_search(&query, 5).await;
@@ -632,6 +639,95 @@ async fn run_chat_repl() -> Result<(), anyhow::Error> {
             }
         }
     }
+
+    Ok(())
+}
+
+async fn run_analyze() -> Result<(), anyhow::Error> {
+    use std::io::{self, Read};
+
+    let mut diff_input = String::new();
+    io::stdin().read_to_string(&mut diff_input)?;
+
+    if diff_input.trim().is_empty() {
+        println!("{}", "No diff provided. Usage: git diff | cbq analyze".yellow());
+        return Ok(());
+    }
+
+    println!("Analyzing changes...\n");
+    let parsed_diffs = parse_diff(&diff_input);
+    
+    if parsed_diffs.is_empty() {
+        println!("No significant code modifications found in the diff.");
+        return Ok(());
+    }
+
+    println!("{} Modified files: {}", "→".cyan().bold(), parsed_diffs.len().to_string().yellow());
+    for diff in &parsed_diffs {
+        println!("  - {} ({} lines added/modified)", diff.file_path.cyan(), diff.added_lines.len());
+    }
+    println!();
+
+    let config = match load_config() {
+        Ok(c) => c,
+        Err(_) => crate::config::settings::Config::default(),
+    };
+
+    let project_path = std::path::Path::new(".");
+    let db_path = match get_db_path(project_path) {
+        Ok(p) => p,
+        Err(err) => return Err(anyhow::anyhow!("Database path error: {}", err)),
+    };
+
+    if !db_path.exists() {
+        println!("{}", "Database does not exist. Run `cargo run -- index .` to enable impact analysis.".yellow());
+        return Ok(());
+    }
+
+    let conn = rusqlite::Connection::open(&db_path)?;
+
+    println!("{}", "Semantic Impact Analysis:".underline().bold());
+    for diff in &parsed_diffs {
+        if diff.added_lines.is_empty() {
+            continue;
+        }
+
+        let added_code = diff.added_lines.join("\n");
+        let query_vector = match generate_embedding(
+            &config.ollama.host,
+            config.ollama.port,
+            &config.ollama.embedding_model,
+            &added_code,
+        ).await {
+            Ok(vec) => vec,
+            Err(_) => continue,
+        };
+
+        match search_codebase(&conn, &query_vector, 2, config.search.similarity_threshold) {
+            Ok(results) => {
+                if results.is_empty() {
+                    println!("  {} No closely related files found in the index for {}", "○".dimmed(), diff.file_path.cyan());
+                } else {
+                    println!("  {} Related context for {}:", "✓".green(), diff.file_path.cyan());
+                    for result in results {
+                        println!(
+                            "      - {} (Line {} to {}) [Sim: {:.2}]",
+                            result.chunk.file_path.display(),
+                            result.chunk.start_line,
+                            result.chunk.end_line,
+                            result.score
+                        );
+                    }
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+    println!();
+    
+    println!("{}", "Suggestions:".underline().bold());
+    println!("  - Review the related context above to ensure APIs are updated symmetrically.");
+    println!("  - Consider running `cargo test` to ensure changes do not break existing logic.");
 
     Ok(())
 }

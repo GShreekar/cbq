@@ -5,3 +5,4 @@ pub mod embeddings;
 pub mod vector_search;
 pub mod chat_history;
 pub mod ollama;
+pub mod git;
