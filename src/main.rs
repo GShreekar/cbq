@@ -385,6 +385,12 @@ async fn main() {
                 Err(err) => eprintln!("Failed to export history: {}", err),
             }
         }
+        Some(Commands::Chat) => {
+            if let Err(err) = run_chat_repl().await {
+                eprintln!("{} Chat session error: {}", "Error:".red().bold(), err);
+                std::process::exit(1);
+            }
+        }
         None => {
             if let Some(query) = args.default_query {
                 run_search(&query, 5).await;
@@ -456,7 +462,7 @@ async fn run_search(query: &str, limit: usize) {
         }
     };
 
-    match search_codebase(&conn, &query_vector, limit) {
+    match search_codebase(&conn, &query_vector, limit, config.search.similarity_threshold) {
         Ok(results) => {
             if results.is_empty() {
                 println!("{}", "No relevant chunks found.".yellow());
@@ -497,4 +503,135 @@ async fn run_search(query: &str, limit: usize) {
             std::process::exit(1);
         }
     }
+}
+
+async fn run_chat_repl() -> Result<(), anyhow::Error> {
+    use std::io::{self, Write};
+
+    let config = match load_config() {
+        Ok(c) => c,
+        Err(_) => {
+            let default_conf = crate::config::settings::Config::default();
+            let _ = crate::config::settings::save_config(&default_conf);
+            default_conf
+        }
+    };
+
+    println!("Checking Ollama connection...");
+    if !check_ollama_status(&config.ollama.host, config.ollama.port).await {
+        eprintln!(
+            "{} Ollama service is not running at {}:{}",
+            "Error:".red().bold(),
+            config.ollama.host,
+            config.ollama.port
+        );
+        std::process::exit(1);
+    }
+
+    let project_path = std::path::Path::new(".");
+    let db_path = match get_db_path(project_path) {
+        Ok(p) => p,
+        Err(err) => return Err(anyhow::anyhow!("Database path error: {}", err)),
+    };
+
+    let conn = rusqlite::Connection::open(&db_path)?;
+
+    println!("\n🤖 {}", "Codebase chat started. Type 'exit' or 'quit' to end session.".cyan().bold());
+    println!("Using embedding model: {}\n", config.ollama.embedding_model.yellow());
+
+    let mut context_queries = Vec::new();
+
+    loop {
+        print!("{} ", ">".green().bold());
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        let query = input.trim();
+
+        if query.is_empty() {
+            continue;
+        }
+
+        if query == "exit" || query == "quit" {
+            println!("{}", "Exiting chat mode. Goodbye!".cyan());
+            break;
+        }
+
+        context_queries.push(query.to_string());
+        println!("Searching for matches...");
+
+        let query_vector = match generate_embedding(
+            &config.ollama.host,
+            config.ollama.port,
+            &config.ollama.embedding_model,
+            query,
+        ).await {
+            Ok(vec) => vec,
+            Err(err) => {
+                eprintln!("{} Failed to generate embedding: {}", "Error:".red().bold(), err);
+                continue;
+            }
+        };
+
+        match search_codebase(&conn, &query_vector, 3, config.search.similarity_threshold) {
+            Ok(results) => {
+                if results.is_empty() {
+                    println!("{}", "No relevant chunks found for this query.".yellow());
+                    continue;
+                }
+
+                println!("\nFound {} relevant chunks:\n", results.len().to_string().yellow().bold());
+
+                for (idx, result) in results.iter().enumerate() {
+                    println!(
+                        "   {}. {} [Score: {:.2}]",
+                        (idx + 1).to_string().bold(),
+                        format!(
+                            "{}:{}-{}",
+                            result.chunk.file_path.display(),
+                            result.chunk.start_line,
+                            result.chunk.end_line
+                        ).magenta().underline(),
+                        result.score
+                    );
+
+                    for line in result.chunk.content.lines().take(3) {
+                        let highlighted = crate::ui::formatter::highlight_code(line);
+                        println!("      {}", highlighted);
+                    }
+                    if result.chunk.content.lines().count() > 3 {
+                        println!("      {}", "...".dimmed());
+                    }
+                    println!();
+                }
+
+                if let Some(top_match) = results.first() {
+                    println!("{}", "🤖 [Mock LLM Response]".blue().bold());
+                    println!(
+                        "Based on the context found in {} ({} {} named '{}'):",
+                        top_match.chunk.file_path.display().to_string().yellow(),
+                        "logical".dimmed(),
+                        top_match.chunk.chunk_type.magenta(),
+                        top_match.chunk.name.bold()
+                    );
+                    println!(
+                        "   We found the implementation details starting at line {}. This snippet addresses your query about '{}'.",
+                        top_match.chunk.start_line,
+                        query.bold()
+                    );
+                    println!();
+                }
+
+                if let Err(e) = save_chat(query, &results) {
+                    eprintln!("Warning: Failed to save search history: {}", e);
+                }
+            }
+            Err(err) => {
+                eprintln!("{} Search failed: {}", "Error:".red().bold(), err);
+            }
+        }
+    }
+
+    Ok(())
 }

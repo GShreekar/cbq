@@ -108,6 +108,38 @@ fn extract_node_name(node: Node, source: &str) -> String {
     "anonymous".to_string()
 }
 
+fn slice_large_chunk(chunk: CodeChunk) -> Vec<CodeChunk> {
+    let lines: Vec<&str> = chunk.content.lines().collect();
+    let mut sub_chunks = Vec::new();
+    let chunk_size = 30;
+    let overlap = 5;
+
+    let mut start = 0;
+    while start < lines.len() {
+        let end = std::cmp::min(start + chunk_size, lines.len());
+        let chunk_lines = &lines[start..end];
+        let chunk_content = chunk_lines.join("\n");
+
+        let sub_start_line = chunk.start_line + start;
+        let sub_end_line = chunk.start_line + end - 1;
+
+        sub_chunks.push(CodeChunk {
+            file_path: chunk.file_path.clone(),
+            name: format!("{}-part-{}-{}", chunk.name, sub_start_line, sub_end_line),
+            chunk_type: chunk.chunk_type.clone(),
+            content: chunk_content,
+            start_line: sub_start_line,
+            end_line: sub_end_line,
+        });
+
+        if end == lines.len() {
+            break;
+        }
+        start += chunk_size - overlap;
+    }
+    sub_chunks
+}
+
 pub fn parse_file(file_path: &Path) -> Result<Vec<CodeChunk>, anyhow::Error> {
     let content = fs::read_to_string(file_path)?;
     let extension = file_path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
@@ -126,7 +158,15 @@ pub fn parse_file(file_path: &Path) -> Result<Vec<CodeChunk>, anyhow::Error> {
                 traverse_ast(root_node, &content, file_path, &mut chunks);
 
                 if !chunks.is_empty() {
-                    return Ok(chunks);
+                    let mut final_chunks = Vec::new();
+                    for chunk in chunks {
+                        if chunk.content.lines().count() > 40 {
+                            final_chunks.extend(slice_large_chunk(chunk));
+                        } else {
+                            final_chunks.push(chunk);
+                        }
+                    }
+                    return Ok(final_chunks);
                 }
             }
         }

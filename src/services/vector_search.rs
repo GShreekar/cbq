@@ -30,6 +30,7 @@ pub fn search_codebase(
     conn: &rusqlite::Connection,
     query_vector: &[f32],
     limit: usize,
+    threshold: f64,
 ) -> Result<Vec<SearchResult>, anyhow::Error> {
     let mut stmt = conn.prepare(
         "SELECT file_path, name, chunk_type, content, start_line, end_line, embedding FROM chunks"
@@ -62,7 +63,9 @@ pub fn search_codebase(
         if let Ok((chunk, bytes)) = item {
             let chunk_vector = bytes_to_vector(&bytes);
             let score = cosine_similarity(query_vector, &chunk_vector);
-            results.push(SearchResult { chunk, score });
+            if score >= threshold {
+                results.push(SearchResult { chunk, score });
+            }
         }
     }
 

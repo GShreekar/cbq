@@ -53,6 +53,8 @@ pub enum Commands {
     History,
     #[command(about = "Export all history logs to a Markdown file")]
     Export,
+    #[command(about = "Start an interactive chat session to query the codebase")]
+    Chat,
 }
 
 #[derive(Subcommand, Debug)]
