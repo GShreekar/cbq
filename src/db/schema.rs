@@ -8,7 +8,10 @@ pub fn get_db_path(project_path: &Path) -> Result<PathBuf, anyhow::Error> {
         .map(PathBuf::from)
         .map_err(|_| anyhow::anyhow!("Could not determine the home directory"))?;
 
-    let project_name = project_path
+    let canonical = fs::canonicalize(project_path)
+        .unwrap_or_else(|_| project_path.to_path_buf());
+
+    let project_name = canonical
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("default-project");

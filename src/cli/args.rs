@@ -4,7 +4,7 @@ use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(
     name = "cbq",
-    version = "0.1.0",
+    version = env!("CARGO_PKG_VERSION"),
     about = "Local-first codebase semantic Q&A and analysis CLI tool",
     after_help = "If no subcommand is provided, the query argument will run a default semantic search."
 )]

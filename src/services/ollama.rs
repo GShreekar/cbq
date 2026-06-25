@@ -89,3 +89,36 @@ pub async fn generate_response_stream<F>(
 
     Ok(())
 }
+
+pub async fn check_and_pull_model(model_name: &str) -> Result<(), anyhow::Error> {
+    use std::process::Command;
+    use colored::Colorize;
+
+    let output = Command::new("ollama")
+        .arg("list")
+        .output();
+        
+    let output = match output {
+        Ok(o) => o,
+        Err(_) => return Err(anyhow::anyhow!("Failed to execute 'ollama list'. Is ollama installed?")),
+    };
+    
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stdout.contains(model_name) {
+        println!("Model '{}' not found. Pulling now... (this may take a while)", model_name.cyan());
+        
+        let mut child = Command::new("ollama")
+            .arg("pull")
+            .arg(model_name)
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("Failed to start 'ollama pull': {}", e))?;
+            
+        let status = child.wait()?;
+        if !status.success() {
+            return Err(anyhow::anyhow!("Failed to pull model '{}'", model_name));
+        }
+        println!("{} Model '{}' pulled successfully", "✓".green(), model_name);
+    }
+    
+    Ok(())
+}

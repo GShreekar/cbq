@@ -62,7 +62,15 @@ pub fn search_codebase(
     for item in chunk_iter {
         if let Ok((chunk, bytes)) = item {
             let chunk_vector = bytes_to_vector(&bytes);
-            let score = cosine_similarity(query_vector, &chunk_vector);
+            let raw_score = cosine_similarity(query_vector, &chunk_vector);
+
+            let path_str = chunk.file_path.to_string_lossy();
+            let is_test_file = path_str.contains("/test")
+                || path_str.contains("\\test")
+                || path_str.contains("test_")
+                || path_str.starts_with("test");
+            let score = if is_test_file { raw_score * 0.8 } else { raw_score };
+
             if score >= threshold {
                 results.push(SearchResult { chunk, score });
             }

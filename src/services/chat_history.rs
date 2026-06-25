@@ -80,15 +80,16 @@ pub fn get_history() -> Result<Vec<ChatEntry>, anyhow::Error> {
     Ok(entries)
 }
 
-pub fn export_history_to_markdown() ->Result<PathBuf, anyhow::Error> {
+pub fn export_history_to_markdown() -> Result<PathBuf, anyhow::Error> {
     let history = get_history()?;
     if history.is_empty() {
         return Err(anyhow::anyhow!("No chat history to export"));
     }
 
+    let chats_dir = get_chats_dir()?;
     let now: DateTime<Local> = Local::now();
-    let file_name = format!("cbq-session-{}.md", now.format("%Y-%m-%d"));
-    let export_path = PathBuf::from(&file_name);
+    let file_name = format!("cbq-session-{}.md", now.format("%Y-%m-%d_%H-%M-%S"));
+    let export_path = chats_dir.join(file_name);
 
     let mut markdown = String::new();
     markdown.push_str("# CBQ Search & Query Session History\n\n");

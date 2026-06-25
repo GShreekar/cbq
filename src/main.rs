@@ -12,7 +12,7 @@ use services::file_discovery::discover_files;
 use services::parser::parse_file;
 use services::vector_search::search_codebase;
 use services::chat_history::{save_chat, get_history, export_history_to_markdown};
-use services::ollama::{check_ollama_status, generate_embedding, generate_response_stream};
+use services::ollama::{check_ollama_status, generate_embedding, generate_response_stream, check_and_pull_model};
 use services::git::parse_diff;
 use config::settings::load_config;
 use db::schema::{get_db_path, init_db};
@@ -54,7 +54,7 @@ async fn main() {
                         );
                     }
 
-                    println!("\n{}", "✓ Ready to index. Run: cargo run -- index <path>".green());
+                    println!("\n{}", "✓ Ready to index. Run: cbq index <path>".green());
                 }
                 Err(err) => {
                     spinner.finish_and_clear();
@@ -142,6 +142,12 @@ async fn main() {
                 std::process::exit(1);
             }
             println!("{} Connected", "✓".green().bold());
+            
+            if let Err(e) = check_and_pull_model(&config.ollama.embedding_model).await {
+                eprintln!("{} {}", "Error:".red().bold(), e);
+                std::process::exit(1);
+            }
+            
             println!("Embedding model: {}", config.ollama.embedding_model.yellow().bold());
             println!();
 
@@ -428,6 +434,15 @@ async fn run_search(query: &str, limit: usize) {
         );
         std::process::exit(1);
     }
+    
+    if let Err(e) = check_and_pull_model(&config.ollama.embedding_model).await {
+        eprintln!("{} {}", "Error:".red().bold(), e);
+        std::process::exit(1);
+    }
+    if let Err(e) = check_and_pull_model(&config.ollama.chat_model).await {
+        eprintln!("{} {}", "Error:".red().bold(), e);
+        std::process::exit(1);
+    }
 
     let project_path = std::path::Path::new(".");
     let db_path = match get_db_path(project_path) {
@@ -553,12 +568,30 @@ async fn run_chat_repl() -> Result<(), anyhow::Error> {
         );
         std::process::exit(1);
     }
+    
+    if let Err(e) = check_and_pull_model(&config.ollama.embedding_model).await {
+        eprintln!("{} {}", "Error:".red().bold(), e);
+        std::process::exit(1);
+    }
+    if let Err(e) = check_and_pull_model(&config.ollama.chat_model).await {
+        eprintln!("{} {}", "Error:".red().bold(), e);
+        std::process::exit(1);
+    }
 
     let project_path = std::path::Path::new(".");
     let db_path = match get_db_path(project_path) {
         Ok(p) => p,
         Err(err) => return Err(anyhow::anyhow!("Database path error: {}", err)),
     };
+
+    if !db_path.exists() {
+        eprintln!(
+            "{} Database does not exist. Please index the workspace first using: {}",
+            "Error:".red().bold(),
+            "cbq index .".yellow().bold()
+        );
+        std::process::exit(1);
+    }
 
     let conn = rusqlite::Connection::open(&db_path)?;
 
@@ -600,7 +633,7 @@ async fn run_chat_repl() -> Result<(), anyhow::Error> {
             }
         };
 
-        match search_codebase(&conn, &query_vector, 3, config.search.similarity_threshold) {
+        match search_codebase(&conn, &query_vector, config.search.top_k, config.search.similarity_threshold) {
             Ok(results) => {
                 if results.is_empty() {
                     println!("{}", "No relevant chunks found for this query.".yellow());
@@ -692,6 +725,11 @@ async fn run_analyze() -> Result<(), anyhow::Error> {
         Ok(c) => c,
         Err(_) => crate::config::settings::Config::default(),
     };
+    
+    if let Err(e) = check_and_pull_model(&config.ollama.embedding_model).await {
+        eprintln!("{} {}", "Error:".red().bold(), e);
+        std::process::exit(1);
+    }
 
     let project_path = std::path::Path::new(".");
     let db_path = match get_db_path(project_path) {
@@ -755,10 +793,14 @@ async fn run_analyze() -> Result<(), anyhow::Error> {
 fn build_prompt(query: &str, results: &[services::vector_search::SearchResult]) -> String {
     let mut context_str = String::new();
     for (i, result) in results.iter().enumerate() {
+        let path_str = result.chunk.file_path.display().to_string();
+        let is_test = path_str.contains("/test") || path_str.contains("test_") || path_str.starts_with("test");
+        let label = if is_test { "(TEST FILE)" } else { "(SOURCE FILE)" };
         context_str.push_str(&format!(
-            "--- Chunk {} ---\nFile: {}\nLines: {}-{}\n```\n{}\n```\n\n",
+            "--- Chunk {} {} ---\nFile: {}\nLines: {}-{}\n```\n{}\n```\n\n",
             i + 1,
-            result.chunk.file_path.display(),
+            label,
+            path_str,
             result.chunk.start_line,
             result.chunk.end_line,
             result.chunk.content
@@ -766,10 +808,18 @@ fn build_prompt(query: &str, results: &[services::vector_search::SearchResult]) 
     }
 
     format!(
-        "You are an expert AI assistant who answers questions about a codebase. \
-        Below is the semantically relevant context retrieved from the database.\n\n\
+        "You are an expert AI assistant that answers questions about a codebase.\n\
+        You are given code chunks retrieved via semantic search, which may include both \
+        source implementation files and test files.\n\n\
+        IMPORTANT RULES:\n\
+        - Prefer explaining from SOURCE FILE chunks over TEST FILE chunks.\n\
+        - If only test files are available, say so explicitly and explain what the tests \
+          REVEAL about the behavior, but clearly state that the actual implementation was \
+          not retrieved.\n\
+        - If the context is insufficient to answer the question accurately, say so. Do NOT \
+          hallucinate or guess implementation details not visible in the provided code.\n\
+        - Always cite the file name and line range when referring to a chunk.\n\n\
         CONTEXT:\n{}\n\n\
-        Use the context above to answer the following user question. Be concise and refer to file names and line ranges when explaining.\n\n\
         QUESTION: {}\n\n\
         ANSWER:",
         context_str, query
