@@ -8,11 +8,17 @@ pub struct Config {
     pub search: SearchConfig,
 }
 
+fn default_chat_model() -> String {
+    "qwen2.5:1.5b".to_string()
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct OllamaConfig {
     pub host: String,
     pub port: u16,
     pub embedding_model: String,
+    #[serde(default = "default_chat_model")]
+    pub chat_model: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

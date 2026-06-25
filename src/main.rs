@@ -5,13 +5,14 @@ pub mod config;
 pub mod ui;
 
 use std::time::Duration;
+use std::io::Write;
 use clap::Parser;
 use cli::args::{Cli, Commands};
 use services::file_discovery::discover_files;
 use services::parser::parse_file;
 use services::vector_search::search_codebase;
 use services::chat_history::{save_chat, get_history, export_history_to_markdown};
-use services::ollama::{check_ollama_status, generate_embedding};
+use services::ollama::{check_ollama_status, generate_embedding, generate_response_stream};
 use services::git::parse_diff;
 use config::settings::load_config;
 use db::schema::{get_db_path, init_db};
@@ -501,6 +502,24 @@ async fn run_search(query: &str, limit: usize) {
                 println!();
             }
 
+            println!("{}", "🤖 [Ollama LLM Response]".blue().bold());
+            let prompt = build_prompt(query, &results);
+            let stream_res = generate_response_stream(
+                &config.ollama.host,
+                config.ollama.port,
+                &config.ollama.chat_model,
+                &prompt,
+                |chunk| {
+                    print!("{}", chunk);
+                    let _ = std::io::stdout().flush();
+                }
+            ).await;
+
+            if let Err(e) = stream_res {
+                eprintln!("\n{} Failed to get LLM response: {}", "Error:".red().bold(), e);
+            }
+            println!("\n");
+
             if let Err(e) = save_chat(query, &results) {
                 eprintln!("Warning: Failed to save search history: {}", e);
             }
@@ -613,22 +632,23 @@ async fn run_chat_repl() -> Result<(), anyhow::Error> {
                     println!();
                 }
 
-                if let Some(top_match) = results.first() {
-                    println!("{}", "🤖 [Mock LLM Response]".blue().bold());
-                    println!(
-                        "Based on the context found in {} ({} {} named '{}'):",
-                        top_match.chunk.file_path.display().to_string().yellow(),
-                        "logical".dimmed(),
-                        top_match.chunk.chunk_type.magenta(),
-                        top_match.chunk.name.bold()
-                    );
-                    println!(
-                        "   We found the implementation details starting at line {}. This snippet addresses your query about '{}'.",
-                        top_match.chunk.start_line,
-                        query.bold()
-                    );
-                    println!();
+                println!("{}", "🤖 [Ollama LLM Response]".blue().bold());
+                let prompt = build_prompt(query, &results);
+                let stream_res = generate_response_stream(
+                    &config.ollama.host,
+                    config.ollama.port,
+                    &config.ollama.chat_model,
+                    &prompt,
+                    |chunk| {
+                        print!("{}", chunk);
+                        let _ = io::stdout().flush();
+                    }
+                ).await;
+
+                if let Err(e) = stream_res {
+                    eprintln!("\n{} Failed to get LLM response: {}", "Error:".red().bold(), e);
                 }
+                println!();
 
                 if let Err(e) = save_chat(query, &results) {
                     eprintln!("Warning: Failed to save search history: {}", e);
@@ -730,4 +750,28 @@ async fn run_analyze() -> Result<(), anyhow::Error> {
     println!("  - Consider running `cargo test` to ensure changes do not break existing logic.");
 
     Ok(())
+}
+
+fn build_prompt(query: &str, results: &[services::vector_search::SearchResult]) -> String {
+    let mut context_str = String::new();
+    for (i, result) in results.iter().enumerate() {
+        context_str.push_str(&format!(
+            "--- Chunk {} ---\nFile: {}\nLines: {}-{}\n```\n{}\n```\n\n",
+            i + 1,
+            result.chunk.file_path.display(),
+            result.chunk.start_line,
+            result.chunk.end_line,
+            result.chunk.content
+        ));
+    }
+
+    format!(
+        "You are an expert AI assistant who answers questions about a codebase. \
+        Below is the semantically relevant context retrieved from the database.\n\n\
+        CONTEXT:\n{}\n\n\
+        Use the context above to answer the following user question. Be concise and refer to file names and line ranges when explaining.\n\n\
+        QUESTION: {}\n\n\
+        ANSWER:",
+        context_str, query
+    )
 }
