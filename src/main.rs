@@ -5,7 +5,6 @@ pub mod config;
 pub mod ui;
 
 use std::time::Duration;
-use std::io::Write;
 use clap::Parser;
 use cli::args::{Cli, Commands};
 use services::file_discovery::discover_files;
@@ -492,46 +491,59 @@ async fn run_search(query: &str, limit: usize) {
                 return;
             }
 
-            println!("\nFound {} relevant chunks:\n", results.len().to_string().yellow().bold());
+            println!("\n{} {} relevant chunks:\n", "🔍 Found".green(), results.len().to_string().yellow().bold());
 
             for (idx, result) in results.iter().enumerate() {
+                let path_str = result.chunk.file_path.display().to_string();
+                let is_test = path_str.contains("/test") || path_str.contains("test_") || path_str.starts_with("test");
+                let badge = if is_test { "🧪" } else { "📄" };
                 println!(
-                    "{}. {} [Score: {:.2}]",
+                    "   {} {} {} {} [Score: {:.2}]",
+                    "└─".dimmed(),
+                    badge,
                     (idx + 1).to_string().bold(),
                     format!(
                         "{}:{}-{}",
-                        result.chunk.file_path.display(),
+                        path_str,
                         result.chunk.start_line,
                         result.chunk.end_line
-                    ).magenta().underline(),
+                    ).cyan(),
                     result.score
                 );
-
-                for line in result.chunk.content.lines().take(5) {
-                    let highlighted = crate::ui::formatter::highlight_code(line);
-                    println!("   {}", highlighted);
-                }
-                if result.chunk.content.lines().count() > 5 {
-                    println!("   {}", "...".dimmed());
-                }
-                println!();
             }
+            println!();
 
             println!("{}", "🤖 [Ollama LLM Response]".blue().bold());
             let prompt = build_prompt(query, &results);
+
+            use indicatif::{ProgressBar, ProgressStyle};
+            let spinner = ProgressBar::new_spinner();
+            spinner.set_style(
+                ProgressStyle::default_spinner()
+                    .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ")
+                    .template("{spinner:.blue} {msg}")
+                    .unwrap(),
+            );
+            spinner.set_message("Thinking...".cyan().to_string());
+            spinner.enable_steady_tick(std::time::Duration::from_millis(100));
+
+            let mut full_response = String::new();
             let stream_res = generate_response_stream(
                 &config.ollama.host,
                 config.ollama.port,
                 &config.ollama.chat_model,
                 &prompt,
                 |chunk| {
-                    print!("{}", chunk);
-                    let _ = std::io::stdout().flush();
+                    full_response.push_str(chunk);
                 }
             ).await;
 
+            spinner.finish_and_clear();
+
             if let Err(e) = stream_res {
                 eprintln!("\n{} Failed to get LLM response: {}", "Error:".red().bold(), e);
+            } else {
+                termimad::print_text(&full_response);
             }
             println!("\n");
 
@@ -640,46 +652,58 @@ async fn run_chat_repl() -> Result<(), anyhow::Error> {
                     continue;
                 }
 
-                println!("\nFound {} relevant chunks:\n", results.len().to_string().yellow().bold());
+                println!("\n{} {} relevant chunks:\n", "🔍 Found".green(), results.len().to_string().yellow().bold());
 
                 for (idx, result) in results.iter().enumerate() {
+                    let path_str = result.chunk.file_path.display().to_string();
+                    let is_test = path_str.contains("/test") || path_str.contains("test_") || path_str.starts_with("test");
+                    let badge = if is_test { "🧪" } else { "📄" };
                     println!(
-                        "   {}. {} [Score: {:.2}]",
+                        "   {} {} {} {} [Score: {:.2}]",
+                        "└─".dimmed(),
+                        badge,
                         (idx + 1).to_string().bold(),
                         format!(
                             "{}:{}-{}",
-                            result.chunk.file_path.display(),
+                            path_str,
                             result.chunk.start_line,
                             result.chunk.end_line
-                        ).magenta().underline(),
+                        ).cyan(),
                         result.score
                     );
-
-                    for line in result.chunk.content.lines().take(3) {
-                        let highlighted = crate::ui::formatter::highlight_code(line);
-                        println!("      {}", highlighted);
-                    }
-                    if result.chunk.content.lines().count() > 3 {
-                        println!("      {}", "...".dimmed());
-                    }
-                    println!();
                 }
+                println!();
 
                 println!("{}", "🤖 [Ollama LLM Response]".blue().bold());
                 let prompt = build_prompt(query, &results);
+
+                let spinner = ProgressBar::new_spinner();
+                spinner.set_style(
+                    ProgressStyle::default_spinner()
+                        .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ")
+                        .template("{spinner:.blue} {msg}")
+                        .unwrap(),
+                );
+                spinner.set_message("Thinking...".cyan().to_string());
+                spinner.enable_steady_tick(std::time::Duration::from_millis(100));
+
+                let mut full_response = String::new();
                 let stream_res = generate_response_stream(
                     &config.ollama.host,
                     config.ollama.port,
                     &config.ollama.chat_model,
                     &prompt,
                     |chunk| {
-                        print!("{}", chunk);
-                        let _ = io::stdout().flush();
+                        full_response.push_str(chunk);
                     }
                 ).await;
 
+                spinner.finish_and_clear();
+
                 if let Err(e) = stream_res {
                     eprintln!("\n{} Failed to get LLM response: {}", "Error:".red().bold(), e);
+                } else {
+                    termimad::print_text(&full_response);
                 }
                 println!();
 
