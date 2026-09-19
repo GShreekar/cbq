@@ -6,3 +6,6 @@ pub mod vector_search;
 pub mod chat_history;
 pub mod ollama;
 pub mod git;
+pub mod hashing;
+pub mod index_plan;
+pub mod review;

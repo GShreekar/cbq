@@ -13,7 +13,7 @@ No code is ever uploaded to the cloud—everything runs entirely on your local m
 - **Code Chat (REPL)**: Talk directly to your codebase in an interactive chat session, maintaining context.
 - **Git Diff Impact Analysis**: Pipe `git diff` to `cbq` to receive a detailed analysis of your changes, including potential bugs, dependencies, and affected components.
 - **Intelligent Chunker**: Parses files using `tree-sitter` AST to chunk code cleanly into logical units (functions, classes, structures, modules) rather than naive line splitting.
-- **Model Auto-Provisioning**: Checks if configured models are downloaded on your local Ollama instance and pulls them automatically if missing.
+- **Model Auto-Provisioning**: Checks whether the configured models are on your Ollama server and pulls any that are missing, over Ollama's HTTP API, so Ollama running in Docker or on another machine works too.
 - **History & Export**: Review your query history or export chat transcripts to Markdown for documentation.
 
 ---
@@ -83,7 +83,11 @@ To get started, you must index your codebase.
   ```bash
   cbq index [path/to/project]
   ```
-  *Note: The SQLite database is stored locally inside your home directory under `~/.cbq/codebases/<project-name>-<path-hash>/db.sqlite`, so projects that share a folder name keep separate indexes. Re-indexing replaces the previous index only once every chunk has been embedded; chunks that fail to embed are skipped and listed.*
+  *Note: The SQLite database is stored locally inside your home directory under `~/.cbq/codebases/<project-name>-<path-hash>/db.sqlite`, so projects that share a folder name keep separate indexes.*
+
+  Re-running `cbq index` only embeds files whose content changed since the last run, and drops files that were deleted; an unchanged project is up to date in well under a second, without contacting Ollama. Each file is saved as soon as it is embedded, so an interrupted run picks up where it stopped. Chunks that fail to embed are skipped, listed, and retried on the next run. Use `--force` to rebuild everything; changing `ollama.embedding_model` triggers a rebuild automatically.
+
+  Indexing honors `.gitignore` (even outside a git repository), `.ignore`, and `.cbqignore` files, which use the same syntax for paths you want kept out of the index. It always skips version-control, dependency and build directories (`.git`, `node_modules`, `vendor`, `target`, `dist`, `build`, virtualenvs and similar), lockfiles, and minified `*.min.*` files. Files over 512 KB are skipped and listed; raise the limit with `cbq index --max-file-size <KB>`.
 
 ---
 
@@ -100,7 +104,7 @@ Once the codebase is indexed, you can run queries.
   ```bash
   cbq "How is the AST traversed?"
   ```
-  Change the number of returned chunks using `--limit`:
+  The number of returned chunks defaults to `search.top_k` from your config; override it with `--limit`:
   ```bash
   cbq search "database initialization" --limit 3
   ```
@@ -120,10 +124,13 @@ Once the codebase is indexed, you can run queries.
 
 ### 3. Git Integration & Impact Analysis
 
-- **Analyze Diffs**:
-  Analyze active git diffs to detect what code was added or changed, find semantically related context files in your repository, and print an impact report.
+- **Review Changes**:
+  `cbq analyze` has the local chat model review a diff for likely bugs and for code elsewhere in the project that depends on what changed. Related code is found by searching the index with each changed hunk; without an index, the diff is still reviewed on its own.
   ```bash
-  git diff | cbq analyze
+  cbq analyze                 # all uncommitted changes (git diff HEAD)
+  cbq analyze --staged        # only what's staged
+  cbq analyze --base main     # everything since this branch left main, including uncommitted work
+  git diff v1.2 | cbq analyze # any diff piped in
   ```
 
 ---

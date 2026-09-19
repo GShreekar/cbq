@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use crate::services::hashing::fnv1a_hash;
 
 const INDEX_FILE_NAME: &str = "db.sqlite";
 
@@ -62,21 +63,9 @@ fn project_key(project_root: &Path) -> String {
     format!("{}-{:016x}", name, fnv1a_hash(project_root.as_os_str().as_encoded_bytes()))
 }
 
-// std's hasher may change between Rust releases, which would orphan every index on disk.
-fn fnv1a_hash(bytes: &[u8]) -> u64 {
-    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    bytes.iter().fold(OFFSET_BASIS, |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(PRIME))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn fnv1a_hash_matches_the_published_test_vector() {
-        assert_eq!(fnv1a_hash(b"a"), 0xaf63_dc4c_8601_ec8c);
-    }
 
     #[test]
     fn same_named_projects_get_different_keys() {

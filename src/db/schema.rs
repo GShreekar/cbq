@@ -30,9 +30,14 @@ pub fn create_tables(conn: &Connection) -> Result<(), anyhow::Error> {
             end_line INTEGER NOT NULL,
             embedding BLOB
         );
+        CREATE INDEX IF NOT EXISTS chunks_by_file ON chunks(file_path);
         CREATE TABLE IF NOT EXISTS meta (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS files (
+            path TEXT PRIMARY KEY,
+            content_hash TEXT
         );",
     )?;
     Ok(())

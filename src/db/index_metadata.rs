@@ -1,4 +1,5 @@
 use rusqlite::{Connection, OptionalExtension, params};
+use crate::services::ollama::is_same_model;
 
 const EMBEDDING_MODEL_KEY: &str = "embedding_model";
 
@@ -27,7 +28,8 @@ pub fn ensure_index_model_matches(conn: &Connection, configured_model: &str) -> 
     ))
 }
 
-fn read_embedding_model(conn: &Connection) -> Result<Option<String>, anyhow::Error> {
+/// Reads the embedding model an index was built with, if one was recorded.
+pub fn read_embedding_model(conn: &Connection) -> Result<Option<String>, anyhow::Error> {
     let has_meta_table: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta')",
         [],
@@ -40,11 +42,6 @@ fn read_embedding_model(conn: &Connection) -> Result<Option<String>, anyhow::Err
         .query_row("SELECT value FROM meta WHERE key = ?1", [EMBEDDING_MODEL_KEY], |row| row.get(0))
         .optional()?;
     Ok(model)
-}
-
-// Ollama resolves a bare model name to its ":latest" tag.
-fn is_same_model(first: &str, second: &str) -> bool {
-    first.trim_end_matches(":latest") == second.trim_end_matches(":latest")
 }
 
 #[cfg(test)]

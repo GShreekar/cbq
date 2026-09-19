@@ -1,9 +1,34 @@
-use serde::{Serialize, Deserialize};
+use std::future::Future;
+use std::time::Duration;
 use futures_util::StreamExt;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 
 // Ollama's default 4,096-token window silently drops the start of longer prompts, rules included.
 // Fixed rather than per-prompt, because changing it forces Ollama to reload the model.
 const CHAT_CONTEXT_TOKENS: u32 = 16_384;
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const STATUS_TIMEOUT: Duration = Duration::from_secs(10);
+// Generous because a busy server queues requests, e.g. an embedding behind another client's long prompt.
+const EMBED_TIMEOUT: Duration = Duration::from_secs(300);
+// Ollama sends nothing until the prompt is evaluated: 82s for 6k tokens on a 1.5B model on CPU.
+const FIRST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// A client for one Ollama server, sharing a connection pool across every request cbq makes.
+pub struct Ollama {
+    http: reqwest::Client,
+    base_url: String,
+}
+
+/// One progress update streamed while Ollama downloads a model.
+#[derive(Debug, Deserialize)]
+pub struct PullProgress {
+    pub status: String,
+    pub total: Option<u64>,
+    pub completed: Option<u64>,
+}
 
 #[derive(Serialize)]
 struct EmbedRequest<'a> {
@@ -21,143 +46,278 @@ struct GenerateResponse {
     response: String,
 }
 
-pub async fn generate_embedding(
-    host: &str,
-    port: u16,
-    model: &str,
-    prompt: &str,
-) -> Result<Vec<f32>, anyhow::Error> {
-    let client = reqwest::Client::new();
-    // Unlike the legacy /api/embeddings, /api/embed truncates over-long input instead of failing.
-    let url = format!("{}:{}/api/embed", host, port);
-
-    let response = client
-        .post(&url)
-        .json(&EmbedRequest { model, input: prompt })
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<EmbedResponse>()
-        .await?;
-
-    response
-        .embeddings
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("Ollama returned no embedding for model '{}'", model))
+#[derive(Deserialize)]
+struct TagsResponse {
+    models: Vec<InstalledModel>,
 }
 
-pub async fn check_ollama_status(host: &str, port: u16) -> bool {
-    let client = reqwest::Client::new();
-    let url = format!("{}:{}/api/tags", host, port);
-    client.get(&url).send().await.is_ok()
+#[derive(Deserialize)]
+struct InstalledModel {
+    name: String,
 }
 
-pub async fn generate_response_stream<F>(
-    host: &str,
-    port: u16,
-    model: &str,
-    prompt: &str,
-    mut on_chunk: F,
-) -> Result<(), anyhow::Error> where F: FnMut(&str), {
-    let client = reqwest::Client::new();
-    let url = format!("{}:{}/api/generate", host, port);
+// Streamed lines either carry data or, even on HTTP 200, an error that ends the stream.
+#[derive(Deserialize)]
+struct StreamLine<T> {
+    #[serde(flatten)]
+    data: Option<T>,
+    error: Option<String>,
+}
 
-    let payload = serde_json::json!({
-        "model": model,
-        "prompt": prompt,
-        "stream": true,
-        "options": { "num_ctx": CHAT_CONTEXT_TOKENS },
-    });
+#[derive(Deserialize)]
+struct GenerateChunk {
+    response: String,
+}
 
-    let response = client.post(&url)
-        .json(&payload)
-        .send()
-        .await?
-        .error_for_status()?;
+impl Ollama {
+    /// Creates a client for the server at `host`:`port`, rejecting addresses that aren't http(s) URLs.
+    pub fn new(host: &str, port: u16) -> Result<Self, anyhow::Error> {
+        let base_url = format!("{}:{}", host.trim_end_matches('/'), port);
+        let is_http_url = reqwest::Url::parse(&base_url)
+            .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.path() == "/");
+        if !is_http_url {
+            anyhow::bail!(
+                "Invalid Ollama address '{}'. Set ollama.host to something like http://localhost",
+                base_url
+            );
+        }
+        let http = reqwest::Client::builder().connect_timeout(CONNECT_TIMEOUT).build()?;
+        Ok(Self { http, base_url })
+    }
 
+    /// Returns the server address, for messages shown to the user.
+    pub fn address(&self) -> &str {
+        &self.base_url
+    }
+
+    /// Confirms an Ollama server is answering at this address.
+    pub async fn check_running(&self) -> Result<(), anyhow::Error> {
+        let response = self
+            .http
+            .get(self.url("/api/tags"))
+            .timeout(STATUS_TIMEOUT)
+            .send()
+            .await
+            .map_err(|err| anyhow::anyhow!("Ollama is not reachable at {}: {}", self.base_url, describe(&err)))?;
+        if !response.status().is_success() {
+            anyhow::bail!(
+                "{} answered with HTTP {}; is ollama.host pointing at an Ollama server?",
+                self.base_url,
+                response.status()
+            );
+        }
+        response.json::<TagsResponse>().await.map_err(|_| {
+            anyhow::anyhow!("{} answered, but not like an Ollama server; check ollama.host", self.base_url)
+        })?;
+        Ok(())
+    }
+
+    /// Reports whether `model` is already downloaded on the server.
+    pub async fn has_model(&self, model: &str) -> Result<bool, anyhow::Error> {
+        let tags = self
+            .http
+            .get(self.url("/api/tags"))
+            .timeout(STATUS_TIMEOUT)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<TagsResponse>()
+            .await?;
+        Ok(tags.models.iter().any(|installed| is_same_model(&installed.name, model)))
+    }
+
+    /// Downloads `model` onto the server, reporting progress as it streams in.
+    pub async fn pull_model(&self, model: &str, mut on_progress: impl FnMut(&PullProgress)) -> Result<(), anyhow::Error> {
+        let request = self.http.post(self.url("/api/pull")).json(&serde_json::json!({ "model": model, "stream": true }));
+        let response = send_within(request.send(), STREAM_IDLE_TIMEOUT).await?.error_for_status()?;
+
+        let mut succeeded = false;
+        read_json_lines(response, |progress: PullProgress| {
+            succeeded = progress.status == "success";
+            on_progress(&progress);
+        })
+        .await
+        .map_err(|err| err.context(format!("Failed to pull model '{}'", model)))?;
+
+        if !succeeded {
+            anyhow::bail!("Pulling model '{}' stopped before it finished", model);
+        }
+        Ok(())
+    }
+
+    /// Embeds `text` with `model`, truncating input longer than the model's context instead of failing.
+    pub async fn embed(&self, model: &str, text: &str) -> Result<Vec<f32>, anyhow::Error> {
+        let response = self
+            .http
+            .post(self.url("/api/embed"))
+            .timeout(EMBED_TIMEOUT)
+            .json(&EmbedRequest { model, input: text })
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<EmbedResponse>()
+            .await?;
+
+        response
+            .embeddings
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("Ollama returned no embedding for model '{}'", model))
+    }
+
+    /// Streams a response to `prompt`, calling `on_chunk` with each piece of text as it arrives.
+    pub async fn generate_stream(
+        &self,
+        model: &str,
+        prompt: &str,
+        mut on_chunk: impl FnMut(&str),
+    ) -> Result<(), anyhow::Error> {
+        let payload = serde_json::json!({
+            "model": model,
+            "prompt": prompt,
+            "stream": true,
+            "options": { "num_ctx": CHAT_CONTEXT_TOKENS },
+        });
+        let request = self.http.post(self.url("/api/generate")).json(&payload);
+        let response = send_within(request.send(), FIRST_RESPONSE_TIMEOUT).await?.error_for_status()?;
+
+        read_json_lines(response, |chunk: GenerateChunk| on_chunk(&chunk.response)).await
+    }
+
+    /// Generates a complete response with no sampling randomness, for internal steps like rewriting a question.
+    pub async fn generate_deterministic(&self, model: &str, prompt: &str) -> Result<String, anyhow::Error> {
+        let payload = serde_json::json!({
+            "model": model,
+            "prompt": prompt,
+            "stream": false,
+            "options": { "num_ctx": CHAT_CONTEXT_TOKENS, "temperature": 0 },
+        });
+        let response = self
+            .http
+            .post(self.url("/api/generate"))
+            .timeout(FIRST_RESPONSE_TIMEOUT)
+            .json(&payload)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<GenerateResponse>()
+            .await?;
+        Ok(response.response)
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("{}{}", self.base_url, path)
+    }
+}
+
+/// Reports whether two model names refer to the same model; Ollama resolves a bare name to its ":latest" tag.
+pub fn is_same_model(first: &str, second: &str) -> bool {
+    first.trim_end_matches(":latest") == second.trim_end_matches(":latest")
+}
+
+async fn send_within(
+    request: impl Future<Output = Result<reqwest::Response, reqwest::Error>>,
+    limit: Duration,
+) -> Result<reqwest::Response, anyhow::Error> {
+    match tokio::time::timeout(limit, request).await {
+        Ok(response) => Ok(response?),
+        Err(_) => anyhow::bail!("Ollama did not respond within {} seconds", limit.as_secs()),
+    }
+}
+
+// Ollama streams one JSON object per line, and a line can be split across network chunks.
+async fn read_json_lines<T: DeserializeOwned>(
+    response: reqwest::Response,
+    mut on_line: impl FnMut(T),
+) -> Result<(), anyhow::Error> {
     let mut stream = response.bytes_stream();
     let mut buffer = Vec::new();
 
-    while let Some(chunk_result) = stream.next().await {
-        let chunk = chunk_result?;
-        buffer.extend_from_slice(&chunk);
+    loop {
+        let next = tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next())
+            .await
+            .map_err(|_| anyhow::anyhow!("Ollama stopped responding for {} seconds", STREAM_IDLE_TIMEOUT.as_secs()))?;
+        let Some(bytes) = next else { break };
+        buffer.extend_from_slice(&bytes?);
 
-        while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
-            let line_bytes = buffer.drain(..=pos).collect::<Vec<u8>>();
-            let line = String::from_utf8_lossy(&line_bytes);
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                if let Some(response_chunk) = json.get("response").and_then(|v| v.as_str()) {
-                    on_chunk(response_chunk);
-                }
+        while let Some(newline) = buffer.iter().position(|&byte| byte == b'\n') {
+            let line: Vec<u8> = buffer.drain(..=newline).collect();
+            if let Some(data) = parse_stream_line(&line)? {
+                on_line(data);
             }
         }
     }
-
-    Ok(())
-}
-
-/// Generates a complete response with no sampling randomness, for internal steps like rewriting a question.
-pub async fn generate_deterministic_response(
-    host: &str,
-    port: u16,
-    model: &str,
-    prompt: &str,
-) -> Result<String, anyhow::Error> {
-    let client = reqwest::Client::new();
-    let url = format!("{}:{}/api/generate", host, port);
-
-    let payload = serde_json::json!({
-        "model": model,
-        "prompt": prompt,
-        "stream": false,
-        "options": { "num_ctx": CHAT_CONTEXT_TOKENS, "temperature": 0 },
-    });
-
-    let response = client.post(&url)
-        .json(&payload)
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<GenerateResponse>()
-        .await?;
-    Ok(response.response)
-}
-
-pub async fn check_and_pull_model(model_name: &str) -> Result<(), anyhow::Error> {
-    use std::process::Command;
-    use colored::Colorize;
-
-    let output = Command::new("ollama")
-        .arg("list")
-        .output();
-        
-    let output = match output {
-        Ok(o) => o,
-        Err(_) => return Err(anyhow::anyhow!("Failed to execute 'ollama list'. Is ollama installed?")),
-    };
-    
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if !stdout.contains(model_name) {
-        println!("Model '{}' not found. Pulling now... (this may take a while)", model_name.cyan());
-        
-        let mut child = Command::new("ollama")
-            .arg("pull")
-            .arg(model_name)
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("Failed to start 'ollama pull': {}", e))?;
-            
-        let status = child.wait()?;
-        if !status.success() {
-            return Err(anyhow::anyhow!("Failed to pull model '{}'", model_name));
-        }
-        println!("{} Model '{}' pulled successfully", "✓".green(), model_name);
+    if let Some(data) = parse_stream_line(&buffer)? {
+        on_line(data);
     }
-    
     Ok(())
+}
+
+fn parse_stream_line<T: DeserializeOwned>(line: &[u8]) -> Result<Option<T>, anyhow::Error> {
+    if line.iter().all(u8::is_ascii_whitespace) {
+        return Ok(None);
+    }
+    let parsed: StreamLine<T> = serde_json::from_slice(line)?;
+    if let Some(error) = parsed.error {
+        anyhow::bail!("Ollama reported an error: {}", error);
+    }
+    Ok(parsed.data)
+}
+
+fn describe(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "the connection timed out"
+    } else if error.is_connect() {
+        "nothing is listening there"
+    } else {
+        "the request failed"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bare_model_name_matches_its_latest_tag() {
+        assert!(is_same_model("nomic-embed-text", "nomic-embed-text:latest"));
+    }
+
+    #[test]
+    fn model_prefix_is_not_a_match() {
+        assert!(!is_same_model("llama3", "llama3.1:latest"));
+    }
+
+    #[test]
+    fn host_with_trailing_slash_is_accepted() {
+        assert_eq!(Ollama::new("http://localhost/", 11434).unwrap().address(), "http://localhost:11434");
+    }
+
+    #[test]
+    fn host_without_scheme_is_rejected() {
+        assert!(Ollama::new("localhost", 11434).is_err());
+    }
+
+    #[test]
+    fn host_with_a_path_is_rejected() {
+        assert!(Ollama::new("http://localhost/api", 11434).is_err());
+    }
+
+    #[test]
+    fn error_line_becomes_an_error() {
+        let result = parse_stream_line::<PullProgress>(br#"{"error":"pull model manifest: file does not exist"}"#);
+        assert!(result.unwrap_err().to_string().contains("file does not exist"));
+    }
+
+    #[test]
+    fn progress_line_is_parsed() {
+        let line = br#"{"status":"pulling 970aa74c0a90","total":274290656,"completed":1024}"#;
+        let progress = parse_stream_line::<PullProgress>(line).unwrap().unwrap();
+        assert_eq!(progress.completed, Some(1024));
+    }
+
+    #[test]
+    fn blank_line_is_skipped() {
+        assert!(parse_stream_line::<PullProgress>(b"  \n").unwrap().is_none());
+    }
 }

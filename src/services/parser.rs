@@ -111,9 +111,14 @@ fn extract_node_name(node: Node, source: &str) -> String {
 
 pub fn parse_file(file_path: &Path) -> Result<Vec<CodeChunk>, anyhow::Error> {
     let content = fs::read_to_string(file_path)?;
-    let mut chunks = parse_syntax_chunks(file_path, &content)?;
+    parse_source(file_path, &content)
+}
+
+/// Splits already-read source into chunks, labelling each with `file_path`.
+pub fn parse_source(file_path: &Path, content: &str) -> Result<Vec<CodeChunk>, anyhow::Error> {
+    let mut chunks = parse_syntax_chunks(file_path, content)?;
     if chunks.is_empty() {
-        chunks = slice_by_lines(file_path.to_path_buf(), &content);
+        chunks = slice_by_lines(file_path.to_path_buf(), content);
     }
 
     let source_lines: Vec<&str> = content.lines().collect();

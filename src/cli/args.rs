@@ -31,18 +31,29 @@ pub enum Commands {
         #[arg(help = "The directory path to scan and parse", default_value = "./")]
         path: PathBuf,
     },
-    #[command(about = "Index code files in a directory and save chunks to the database")]
+    #[command(about = "Index code files in a directory, re-embedding only files that changed since the last run")]
     Index {
         #[arg(help = "The target directory path to index", default_value = "./")]
         path: PathBuf,
+
+        #[arg(long, help = "Rebuild the whole index instead of updating only changed files")]
+        force: bool,
+
+        #[arg(
+            long = "max-file-size",
+            value_name = "KB",
+            help = "Skip files larger than this many kilobytes",
+            default_value_t = 512
+        )]
+        max_file_size_kb: u64,
     },
     #[command(about = "Search the indexed codebase using keywords")]
     Search {
         #[arg(help = "The question or term to search for")]
         query: String,
 
-        #[arg(help = "The maximum number of results to display", short, long, default_value_t = 5)]
-        limit: usize,
+        #[arg(help = "The maximum number of results to display [default: search.top_k from config]", short, long)]
+        limit: Option<usize>,
 
         #[arg(
             short = 'C',
@@ -71,8 +82,23 @@ pub enum Commands {
         )]
         directory: PathBuf,
     },
-    #[command(about = "Analyze git diffs from stdin to show impact analysis")]
+    #[command(
+        about = "Review a git diff for bugs and affected code",
+        long_about = "Review a git diff for bugs and affected code.\n\n\
+            Reads a diff piped on stdin (git diff | cbq analyze). With nothing piped, runs git itself: \
+            all uncommitted changes by default, or the changes selected by --staged or --base."
+    )]
     Analyze {
+        #[arg(long, help = "Review only staged changes", conflicts_with = "base")]
+        staged: bool,
+
+        #[arg(
+            long,
+            value_name = "REF",
+            help = "Review everything since this branch diverged from REF, including uncommitted work"
+        )]
+        base: Option<String>,
+
         #[arg(
             short = 'C',
             long,
