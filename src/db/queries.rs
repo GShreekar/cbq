@@ -1,17 +1,22 @@
 use rusqlite::{params, Connection};
+use crate::db::index_metadata::write_embedding_model;
 use crate::services::chunker::CodeChunk;
 
-pub fn clear_chunks(conn: &Connection) -> Result<(), anyhow::Error> {
-    conn.execute("DELETE FROM chunks", [])?;
-    Ok(())
-}
-
-pub fn insert_chunks(
+/// Replaces every stored chunk and records the embedding model, all in one transaction.
+pub fn replace_index(
     conn: &mut Connection,
     chunks: &[CodeChunk],
     embeddings: &[Vec<f32>],
+    embedding_model: &str,
 ) -> Result<(), anyhow::Error> {
+    anyhow::ensure!(
+        chunks.len() == embeddings.len(),
+        "{} chunks but {} embeddings",
+        chunks.len(),
+        embeddings.len()
+    );
     let tx = conn.transaction()?;
+    tx.execute("DELETE FROM chunks", [])?;
 
     {
         let mut stmt = tx.prepare(
@@ -33,6 +38,7 @@ pub fn insert_chunks(
         }
     }
 
+    write_embedding_model(&tx, embedding_model)?;
     tx.commit()?;
     Ok(())
 }

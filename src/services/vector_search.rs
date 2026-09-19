@@ -62,6 +62,14 @@ pub fn search_codebase(
     for item in chunk_iter {
         if let Ok((chunk, bytes)) = item {
             let chunk_vector = bytes_to_vector(&bytes);
+            if chunk_vector.len() != query_vector.len() {
+                return Err(anyhow::anyhow!(
+                    "The index stores {}-dimension vectors, but the query embedding has {}. \
+                     The embedding model changed since indexing; rebuild the index with `cbq index`.",
+                    chunk_vector.len(),
+                    query_vector.len()
+                ));
+            }
             let raw_score = cosine_similarity(query_vector, &chunk_vector);
 
             let path_str = chunk.file_path.to_string_lossy();
@@ -98,5 +106,17 @@ mod tests {
 
         let d = vec![-1.0, 0.0, 0.0];
         assert!((cosine_similarity(&a, &d) - (-1.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn search_fails_when_query_and_index_dimensions_differ() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::schema::create_tables(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO chunks (file_path, name, chunk_type, content, start_line, end_line, embedding)
+             VALUES ('src/lib.rs', 'run', 'function', 'fn run() {}', 1, 1, ?1)",
+            [crate::services::embeddings::vector_to_bytes(&[0.5; 768])],
+        ).unwrap();
+        assert!(search_codebase(&conn, &[0.5; 1024], 5, 0.0).is_err());
     }
 }

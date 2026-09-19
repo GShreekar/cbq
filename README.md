@@ -83,7 +83,7 @@ To get started, you must index your codebase.
   ```bash
   cbq index [path/to/project]
   ```
-  *Note: The SQLite database is stored locally inside your home directory under `~/.cbq/codebases/<project-name>/embeddings.db`.*
+  *Note: The SQLite database is stored locally inside your home directory under `~/.cbq/codebases/<project-name>-<path-hash>/db.sqlite`, so projects that share a folder name keep separate indexes. Re-indexing replaces the previous index only once every chunk has been embedded; chunks that fail to embed are skipped and listed.*
 
 ---
 
@@ -104,13 +104,17 @@ Once the codebase is indexed, you can run queries.
   ```bash
   cbq search "database initialization" --limit 3
   ```
+  Queries work from any subdirectory: `cbq` uses the nearest indexed directory at or above where you run it. To query a different project, pass `-C`:
+  ```bash
+  cbq search "database initialization" -C ~/code/other-project
+  ```
 
 - **Interactive Chat REPL**:
   Start a persistent chat session to explore your codebase interactively.
   ```bash
   cbq chat
   ```
-  Type `exit` or `quit` to exit the chat mode.
+  The session remembers the conversation, so follow-ups like "what calls it?" refer back to earlier answers. Type `/clear` to start a new conversation, and `exit`, `quit` or `Ctrl-D` to leave.
 
 ---
 

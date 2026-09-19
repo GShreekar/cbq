@@ -1,9 +1,10 @@
 use std::fs;
 use std::path::Path;
 use tree_sitter::{Parser, Node};
-use crate::services::chunker::{CodeChunk, slice_by_lines};
+use crate::services::chunker::{CodeChunk, MAX_CHUNK_BYTES, fit_to_byte_budget, slice_by_lines};
 
-fn extension_to_language_name(ext: &str) -> Option<&'static str> {
+/// Maps a lowercase file extension to its tree-sitter grammar name.
+pub fn extension_to_language_name(ext: &str) -> Option<&'static str> {
     match ext {
         "rs" => Some("rust"),
         "py" => Some("python"),
@@ -19,7 +20,7 @@ fn extension_to_language_name(ext: &str) -> Option<&'static str> {
         "java" => Some("java"),
         "rb" => Some("ruby"),
         "php" => Some("php"),
-        "cs" => Some("c_sharp"),
+        "cs" => Some("csharp"),
         "html" => Some("html"),
         "css" => Some("css"),
         "sh" | "bash" | "zsh" => Some("bash"),
@@ -108,86 +109,74 @@ fn extract_node_name(node: Node, source: &str) -> String {
     "anonymous".to_string()
 }
 
-fn slice_large_chunk(chunk: CodeChunk) -> Vec<CodeChunk> {
-    let lines: Vec<&str> = chunk.content.lines().collect();
-    let mut sub_chunks = Vec::new();
-    let chunk_size = 30;
-    let overlap = 5;
-
-    let mut start = 0;
-    while start < lines.len() {
-        let end = std::cmp::min(start + chunk_size, lines.len());
-        let chunk_lines = &lines[start..end];
-        let chunk_content = chunk_lines.join("\n");
-
-        let sub_start_line = chunk.start_line + start;
-        let sub_end_line = chunk.start_line + end - 1;
-
-        sub_chunks.push(CodeChunk {
-            file_path: chunk.file_path.clone(),
-            name: format!("{}-part-{}-{}", chunk.name, sub_start_line, sub_end_line),
-            chunk_type: chunk.chunk_type.clone(),
-            content: chunk_content,
-            start_line: sub_start_line,
-            end_line: sub_end_line,
-        });
-
-        if end == lines.len() {
-            break;
-        }
-        start += chunk_size - overlap;
-    }
-    sub_chunks
-}
-
 pub fn parse_file(file_path: &Path) -> Result<Vec<CodeChunk>, anyhow::Error> {
     let content = fs::read_to_string(file_path)?;
-    let extension = file_path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-
-    let lang_name = extension_to_language_name(&extension);
-
-    if let Some(name) = lang_name {
-        if let Ok(language) = tree_sitter_language_pack::get_language(name) {
-            let mut parser = Parser::new();
-            parser.set_language(&language)?;
-
-            if let Some(tree) = parser.parse(&content, None) {
-                let root_node = tree.root_node();
-                let mut chunks = Vec::new();
-
-                traverse_ast(root_node, &content, file_path, &mut chunks);
-
-                if !chunks.is_empty() {
-                    let mut final_chunks = Vec::new();
-                    for chunk in chunks {
-                        if chunk.content.lines().count() > 40 {
-                            final_chunks.extend(slice_large_chunk(chunk));
-                        } else {
-                            final_chunks.push(chunk);
-                        }
-                    }
-                    return Ok(final_chunks);
-                }
-            }
-        }
+    let mut chunks = parse_syntax_chunks(file_path, &content)?;
+    if chunks.is_empty() {
+        chunks = slice_by_lines(file_path.to_path_buf(), &content);
     }
 
-    Ok(slice_by_lines(file_path.to_path_buf(), &content))
+    let source_lines: Vec<&str> = content.lines().collect();
+    Ok(chunks
+        .into_iter()
+        .flat_map(|chunk| fit_to_byte_budget(chunk, &source_lines))
+        .collect())
 }
 
-fn traverse_ast(node: Node, source: &str, file_path: &Path, chunks: &mut Vec<CodeChunk>) {
+fn parse_syntax_chunks(file_path: &Path, content: &str) -> Result<Vec<CodeChunk>, anyhow::Error> {
+    let extension = file_path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    let Some(language_name) = extension_to_language_name(&extension) else {
+        return Ok(Vec::new());
+    };
+    // Grammars are fetched on first use; without one the file is still indexed by line windows.
+    let Ok(language) = tree_sitter_language_pack::get_language(language_name) else {
+        return Ok(Vec::new());
+    };
+
+    let mut parser = Parser::new();
+    parser.set_language(&language)?;
+    let Some(tree) = parser.parse(content, None) else {
+        return Ok(Vec::new());
+    };
+
+    let mut chunks = Vec::new();
+    traverse_ast(tree.root_node(), content, file_path, &mut chunks, None);
+    Ok(chunks)
+}
+
+fn traverse_ast(node: Node, source: &str, file_path: &Path, chunks: &mut Vec<CodeChunk>, parent_sig: Option<&str>) {
     let node_type = node.kind();
     let is_structural = is_structural_node(node_type);
+    let is_container = is_container_node(node_type);
+
+    let mut current_sig = parent_sig.map(|s| s.to_string());
+    let mut container_index = None;
 
     if is_structural {
         let start_byte = node.start_byte();
         let end_byte = node.end_byte();
         
         if start_byte < source.len() && end_byte <= source.len() {
-            let chunk_content = source[start_byte..end_byte].to_string();
+            let mut chunk_content = source[start_byte..end_byte].to_string();
             let start_line = node.start_position().row + 1;
             let end_line = node.end_position().row + 1;
             let name = extract_node_name(node, source);
+
+            if is_container {
+                container_index = Some(chunks.len());
+                let text = &source[start_byte..end_byte];
+                if let Some(idx) = text.find('{') {
+                    current_sig = Some(source[start_byte..start_byte + idx + 1].trim().to_string());
+                } else {
+                    current_sig = Some(format!("{} {{", name));
+                }
+            }
+
+            if let Some(sig) = parent_sig {
+                if !is_container {
+                    chunk_content = format!("{}\n    // ...\n{}\n}}", sig, chunk_content);
+                }
+            }
 
             chunks.push(CodeChunk {
                 file_path: file_path.to_path_buf(),
@@ -200,10 +189,17 @@ fn traverse_ast(node: Node, source: &str, file_path: &Path, chunks: &mut Vec<Cod
         }
     }
 
-    if !is_structural || is_container_node(node_type) {
+    if !is_structural || is_container {
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            traverse_ast(child, source, file_path, chunks);
+            traverse_ast(child, source, file_path, chunks, current_sig.as_deref());
+        }
+    }
+
+    if let Some(index) = container_index {
+        let has_member_chunks = chunks.len() > index + 1;
+        if has_member_chunks && chunks[index].content.len() > MAX_CHUNK_BYTES {
+            chunks.remove(index); // its members are already indexed individually
         }
     }
 }

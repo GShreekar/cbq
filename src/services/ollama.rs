@@ -1,15 +1,24 @@
 use serde::{Serialize, Deserialize};
 use futures_util::StreamExt;
 
+// Ollama's default 4,096-token window silently drops the start of longer prompts, rules included.
+// Fixed rather than per-prompt, because changing it forces Ollama to reload the model.
+const CHAT_CONTEXT_TOKENS: u32 = 16_384;
+
 #[derive(Serialize)]
-struct EmbedRequest {
-    model: String,
-    prompt: String,
+struct EmbedRequest<'a> {
+    model: &'a str,
+    input: &'a str,
 }
 
 #[derive(Deserialize)]
 struct EmbedResponse {
-    embedding: Vec<f32>,
+    embeddings: Vec<Vec<f32>>,
+}
+
+#[derive(Deserialize)]
+struct GenerateResponse {
+    response: String,
 }
 
 pub async fn generate_embedding(
@@ -19,21 +28,23 @@ pub async fn generate_embedding(
     prompt: &str,
 ) -> Result<Vec<f32>, anyhow::Error> {
     let client = reqwest::Client::new();
-    let url = format!("{}:{}/api/embeddings", host, port);
+    // Unlike the legacy /api/embeddings, /api/embed truncates over-long input instead of failing.
+    let url = format!("{}:{}/api/embed", host, port);
 
     let response = client
         .post(&url)
-        .json(&EmbedRequest {
-            model: model.to_string(),
-            prompt: prompt.to_string(),
-        })
+        .json(&EmbedRequest { model, input: prompt })
         .send()
         .await?
         .error_for_status()?
         .json::<EmbedResponse>()
         .await?;
 
-    Ok(response.embedding)
+    response
+        .embeddings
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("Ollama returned no embedding for model '{}'", model))
 }
 
 pub async fn check_ollama_status(host: &str, port: u16) -> bool {
@@ -56,6 +67,7 @@ pub async fn generate_response_stream<F>(
         "model": model,
         "prompt": prompt,
         "stream": true,
+        "options": { "num_ctx": CHAT_CONTEXT_TOKENS },
     });
 
     let response = client.post(&url)
@@ -88,6 +100,33 @@ pub async fn generate_response_stream<F>(
     }
 
     Ok(())
+}
+
+/// Generates a complete response with no sampling randomness, for internal steps like rewriting a question.
+pub async fn generate_deterministic_response(
+    host: &str,
+    port: u16,
+    model: &str,
+    prompt: &str,
+) -> Result<String, anyhow::Error> {
+    let client = reqwest::Client::new();
+    let url = format!("{}:{}/api/generate", host, port);
+
+    let payload = serde_json::json!({
+        "model": model,
+        "prompt": prompt,
+        "stream": false,
+        "options": { "num_ctx": CHAT_CONTEXT_TOKENS, "temperature": 0 },
+    });
+
+    let response = client.post(&url)
+        .json(&payload)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<GenerateResponse>()
+        .await?;
+    Ok(response.response)
 }
 
 pub async fn check_and_pull_model(model_name: &str) -> Result<(), anyhow::Error> {

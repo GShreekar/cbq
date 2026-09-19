@@ -43,6 +43,14 @@ pub enum Commands {
 
         #[arg(help = "The maximum number of results to display", short, long, default_value_t = 5)]
         limit: usize,
+
+        #[arg(
+            short = 'C',
+            long,
+            help = "Project directory to use instead of the current one",
+            default_value = "."
+        )]
+        directory: PathBuf,
     },
     #[command(about = "Manage global configuration settings")]
     Config {
@@ -54,9 +62,25 @@ pub enum Commands {
     #[command(about = "Export all history logs to a Markdown file")]
     Export,
     #[command(about = "Start an interactive chat session to query the codebase")]
-    Chat,
+    Chat {
+        #[arg(
+            short = 'C',
+            long,
+            help = "Project directory to use instead of the current one",
+            default_value = "."
+        )]
+        directory: PathBuf,
+    },
     #[command(about = "Analyze git diffs from stdin to show impact analysis")]
-    Analyze,
+    Analyze {
+        #[arg(
+            short = 'C',
+            long,
+            help = "Project directory to use instead of the current one",
+            default_value = "."
+        )]
+        directory: PathBuf,
+    },
 }
 
 #[derive(Subcommand, Debug)]

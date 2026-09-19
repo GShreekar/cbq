@@ -1,32 +1,25 @@
 use std::fs;
-use std::path::{Path, PathBuf};
-use rusqlite::Connection;
+use std::path::Path;
+use rusqlite::{Connection, OpenFlags};
 
-pub fn get_db_path(project_path: &Path) -> Result<PathBuf, anyhow::Error> {
-    let home_dir = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map(PathBuf::from)
-        .map_err(|_| anyhow::anyhow!("Could not determine the home directory"))?;
-
-    let canonical = fs::canonicalize(project_path)
-        .unwrap_or_else(|_| project_path.to_path_buf());
-
-    let project_name = canonical
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("default-project");
-
-    let db_dir = home_dir.join(".cbq").join("codebases").join(project_name);
-
-    fs::create_dir_all(&db_dir)?;
-
-    Ok(db_dir.join("db.sqlite"))
+/// Creates the index database and its directory if needed, ready for indexing.
+pub fn init_db(db_path: &Path) -> Result<Connection, anyhow::Error> {
+    if let Some(db_dir) = db_path.parent() {
+        fs::create_dir_all(db_dir)?;
+    }
+    let conn = Connection::open(db_path)?;
+    create_tables(&conn)?;
+    Ok(conn)
 }
 
-pub fn init_db(db_path: &Path) -> Result<Connection, anyhow::Error> {
-    let conn = Connection::open(db_path)?;
+/// Opens an existing index database for searching.
+pub fn open_index(db_path: &Path) -> Result<Connection, anyhow::Error> {
+    Ok(Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?)
+}
 
-    conn.execute(
+/// Creates the index tables if they don't exist yet.
+pub fn create_tables(conn: &Connection) -> Result<(), anyhow::Error> {
+    conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS chunks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             file_path TEXT NOT NULL,
@@ -36,9 +29,11 @@ pub fn init_db(db_path: &Path) -> Result<Connection, anyhow::Error> {
             start_line INTEGER NOT NULL,
             end_line INTEGER NOT NULL,
             embedding BLOB
-        )",
-        [],
+        );
+        CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );",
     )?;
-
-    Ok(conn)
+    Ok(())
 }
