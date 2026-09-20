@@ -21,9 +21,9 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    #[command(about = "Initialize and index code files in a target directory")]
+    #[command(about = "Report which files in a directory would be indexed")]
     Init {
-        #[arg(help = "The target directory path to index", default_value = "./")]
+        #[arg(help = "The target directory path to scan", default_value = "./")]
         path: PathBuf,
     },
     #[command(about = "Parse code files in a directory and print detected chunks")]
@@ -68,10 +68,32 @@ pub enum Commands {
         #[command(subcommand)]
         action: ConfigAction,
     },
-    #[command(about = "Display the history of search queries")]
-    History,
-    #[command(about = "Export all history logs to a Markdown file")]
-    Export,
+    #[command(about = "Display the questions asked about this project")]
+    History {
+        #[arg(help = "How many recent questions to show", short, long, default_value_t = 20)]
+        limit: usize,
+
+        #[arg(
+            short = 'C',
+            long,
+            help = "Project directory to use instead of the current one",
+            default_value = "."
+        )]
+        directory: PathBuf,
+    },
+    #[command(about = "Export this project's questions and answers to a Markdown file")]
+    Export {
+        #[arg(help = "Where to write the transcript", short, long, value_name = "FILE")]
+        output: Option<PathBuf>,
+
+        #[arg(
+            short = 'C',
+            long,
+            help = "Project directory to use instead of the current one",
+            default_value = "."
+        )]
+        directory: PathBuf,
+    },
     #[command(about = "Start an interactive chat session to query the codebase")]
     Chat {
         #[arg(

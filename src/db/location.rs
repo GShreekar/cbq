@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use crate::config::settings::cbq_home;
 use crate::services::hashing::fnv1a_hash;
 
 const INDEX_FILE_NAME: &str = "db.sqlite";
@@ -47,11 +48,7 @@ pub fn find_legacy_index(start_dir: &Path) -> Result<Option<PathBuf>, anyhow::Er
 }
 
 fn codebases_dir() -> Result<PathBuf, anyhow::Error> {
-    let home_dir = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map(PathBuf::from)
-        .map_err(|_| anyhow::anyhow!("Could not determine the home directory"))?;
-    Ok(home_dir.join(".cbq").join("codebases"))
+    Ok(cbq_home()?.join("codebases"))
 }
 
 // The path hash keeps same-named projects in different places from sharing one index.

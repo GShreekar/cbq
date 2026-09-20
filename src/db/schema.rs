@@ -12,9 +12,12 @@ pub fn init_db(db_path: &Path) -> Result<Connection, anyhow::Error> {
     Ok(conn)
 }
 
-/// Opens an existing index database for searching.
+/// Opens an existing index database for querying, adding any tables it predates.
 pub fn open_index(db_path: &Path) -> Result<Connection, anyhow::Error> {
-    Ok(Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?)
+    // Read-write because questions and answers are recorded back into the project's own index.
+    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    create_tables(&conn)?;
+    Ok(conn)
 }
 
 /// Creates the index tables if they don't exist yet.
@@ -38,6 +41,14 @@ pub fn create_tables(conn: &Connection) -> Result<(), anyhow::Error> {
         CREATE TABLE IF NOT EXISTS files (
             path TEXT PRIMARY KEY,
             content_hash TEXT
+        );
+        CREATE TABLE IF NOT EXISTS turns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            asked_at TEXT NOT NULL,
+            question TEXT NOT NULL,
+            answer TEXT,
+            citations TEXT NOT NULL
         );",
     )?;
     Ok(())

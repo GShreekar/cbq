@@ -14,14 +14,17 @@ use services::chunker::CodeChunk;
 use services::file_discovery::{discover_files, SkipReason, SkippedFile, DEFAULT_MAX_FILE_BYTES};
 use services::index_plan::{plan_index, read_source_file, IndexPlan, SourceFile};
 use services::parser::{parse_file, parse_source};
-use services::vector_search::{search_codebase, SearchResult};
-use services::chat_history::{save_chat, get_history, export_history_to_markdown};
+use services::vector_search::{is_test_file, search_codebase, SearchResult};
+use services::chat_history::{
+    citations_from, count_turns, default_export_path, new_session_id, now_timestamp, read_turns, record_turn,
+    render_transcript, RecordedTurn,
+};
 use services::ollama::{is_same_model, Ollama};
 use services::git::{find_repository_root, parse_diff, read_git_diff, DiffSource, FileChange, FileDiff, Hunk};
 use services::review::{
     build_review_prompt, describe_change, is_changed_code, merge_related_code, to_diff_path, to_index_path,
 };
-use config::settings::{load_config, Config};
+use config::settings::{cbq_home, load_config, Config};
 use db::schema::{init_db, open_index};
 use db::location::{canonical_project_root, find_indexed_project, find_legacy_index, index_path_for, IndexedProject};
 use db::index_metadata::{ensure_index_model_matches, read_embedding_model, write_embedding_model};
@@ -29,6 +32,8 @@ use db::queries::{
     delete_untracked_chunks, get_db_stats, has_chunks, read_file_hashes, remove_files, replace_file_chunks,
     reset_index, FileUpdate,
 };
+use ui::formatter::{print_error, print_warning_msg};
+use ui::stream::StreamingMarkdown;
 use indicatif::{ProgressBar, ProgressStyle};
 use colored::Colorize;
 
@@ -54,6 +59,8 @@ struct Session<'a> {
     config: &'a Config,
     ollama: &'a Ollama,
     conn: &'a rusqlite::Connection,
+    // Groups the questions asked in one chat session or one review.
+    session_id: String,
 }
 
 #[derive(Default)]
@@ -124,7 +131,7 @@ async fn main() {
                 }
                 Err(err) => {
                     spinner.finish_and_clear();
-                    eprintln!("{} {}", "Error scanning files:".red().bold(), err);
+                    print_error(&format!("Could not scan files: {}", err));
                     std::process::exit(1);
                 }
             }
@@ -162,12 +169,7 @@ async fn main() {
                                 }
                             }
                             Err(err) => {
-                                eprintln!(
-                                    "{} Failed to parse {}: {}",
-                                    "Error:".red().bold(),
-                                    file.display(),
-                                    err
-                                );
+                                print_error(&format!("Failed to parse {}: {}", file.display(), err));
                             }
                         }
                     }
@@ -180,14 +182,14 @@ async fn main() {
                 }
                 Err(err) => {
                     spinner.finish_and_clear();
-                    eprintln!("{} {}", "Error:".red().bold(), err);
+                    print_error(&format!("{}", err));
                     std::process::exit(1);
                 }
             }
         }
         Some(Commands::Index { path, force, max_file_size_kb }) => {
             if let Err(err) = run_index(&path, force, max_file_size_kb * 1024).await {
-                eprintln!("{} {:#}", "Error:".red().bold(), err);
+                print_error(&format!("{:#}", err));
                 std::process::exit(1);
             }
         }
@@ -200,7 +202,7 @@ async fn main() {
                     let path = config::settings::get_config_path().unwrap();
                     let default_conf = config::settings::Config::default();
                     if let Err(e) = config::settings::save_config(&default_conf) {
-                        eprintln!("Failed to save config: {}", e);
+                        print_error(&format!("Failed to save config: {}", e));
                     } else {
                         println!("Created {} with defaults", path.to_string_lossy());
                     }
@@ -211,14 +213,14 @@ async fn main() {
                             let toml_str = toml::to_string(&conf).unwrap();
                             println!("{}", toml_str);
                         }
-                        Err(e) => eprintln!("Failed to load config: {}", e),
+                        Err(e) => print_error(&format!("Failed to load config: {}", e)),
                     }
                 }
                 cli::args::ConfigAction::Set { key, value } => {
                     let mut conf = match config::settings::load_config() {
                         Ok(c) => c,
                         Err(e) => {
-                            eprintln!("Failed to load config: {}", e);
+                            print_error(&format!("Failed to load config: {}", e));
                             std::process::exit(1);
                         }
                     };
@@ -229,7 +231,7 @@ async fn main() {
                             if let Ok(v) = value.parse::<u16>() {
                                 conf.ollama.port = v;
                             } else {
-                                eprintln!("Error: port must be an integer");
+                                print_error("port must be a whole number");
                                 std::process::exit(1);
                             }
                         }
@@ -246,7 +248,7 @@ async fn main() {
                             if let Ok(v) = value.parse::<usize>() {
                                 conf.search.top_k = v;
                             } else {
-                                eprintln!("Error: top_k must be an integer");
+                                print_error("top_k must be a whole number");
                                 std::process::exit(1);
                             }
                         }
@@ -254,58 +256,39 @@ async fn main() {
                             if let Ok(v) = value.parse::<f64>() {
                                 conf.search.similarity_threshold = v;
                             } else {
-                                eprintln!("Error: similarity_threshold must be a float");
+                                print_error("similarity_threshold must be a number between 0 and 1");
                                 std::process::exit(1);
                             }
                         }
                         _ => {
-                            eprintln!("Unknown config key: '{}'", key);
+                            print_error(&format!("Unknown config key '{}'", key));
                             std::process::exit(1);
                         }
                     }
 
                     if let Err(e) = config::settings::save_config(&conf) {
-                        eprintln!("Failed to save config: {}", e);
+                        print_error(&format!("Failed to save config: {}", e));
                     } else {
                         println!("{}", "✓ Updated config".green());
                     }
                 }
             }
         }
-        Some(Commands::History) => {
-            match get_history() {
-                Ok(history) => {
-                    if history.is_empty() {
-                        println!("No search history found.");
-                        return;
-                    }
-                    crate::ui::formatter::print_section("Search Query History Log");
-                    for entry in history {
-                        println!(
-                            "{} - \"{}\" ({} matches)",
-                            entry.timestamp.dimmed(),
-                            entry.query.bold().yellow(),
-                            entry.results.len()
-                        );
-                    }
-                }
-                Err(err) => eprintln!("Failed to retrieve history: {}", err),
+        Some(Commands::History { limit, directory }) => {
+            if let Err(err) = show_history(&directory, limit) {
+                print_error(&format!("{:#}", err));
+                std::process::exit(1);
             }
         }
-        Some(Commands::Export) => {
-            match export_history_to_markdown() {
-                Ok(path) => {
-                    crate::ui::formatter::print_success_msg(&format!(
-                        "Exported search history to: {}",
-                        path.to_string_lossy().underline().yellow()
-                    ));
-                }
-                Err(err) => eprintln!("Failed to export history: {}", err),
+        Some(Commands::Export { output, directory }) => {
+            if let Err(err) = export_history(&directory, output.as_deref()) {
+                print_error(&format!("{:#}", err));
+                std::process::exit(1);
             }
         }
         Some(Commands::Chat { directory }) => {
             if let Err(err) = run_chat_repl(&directory).await {
-                eprintln!("{} Chat session error: {}", "Error:".red().bold(), err);
+                print_error(&format!("Chat session error: {:#}", err));
                 std::process::exit(1);
             }
         }
@@ -316,7 +299,7 @@ async fn main() {
                 (false, None) => None,
             };
             if let Err(err) = run_analyze(&directory, requested_source).await {
-                eprintln!("{} Analysis failed: {:#}", "Error:".red().bold(), err);
+                print_error(&format!("Analysis failed: {:#}", err));
                 std::process::exit(1);
             }
         }
@@ -467,7 +450,7 @@ fn parse_planned_files(plan: &IndexPlan) -> Vec<ParsedFile> {
         // Chunks are labelled with the relative path, which is how the index and search results refer to files.
         let parsed = parse_source(Path::new(&file.relative_path), &file.content);
         if let Err(err) = &parsed {
-            parse_pb.suspend(|| eprintln!("Warning: failed to parse {}: {}", file.relative_path, err));
+            parse_pb.suspend(|| print_warning_msg(&format!("Failed to parse {}: {}", file.relative_path, err)));
         }
         let parse_failed = parsed.is_err();
         let chunks = parsed.unwrap_or_default();
@@ -581,12 +564,12 @@ fn print_skipped_chunks(skipped: &[String]) {
         skipped.len()
     ));
     for failure in skipped.iter().take(MAX_SKIPPED_ITEMS_LISTED) {
-        println!("    {}", failure.dimmed());
+        eprintln!("    {}", failure.dimmed());
     }
     if skipped.len() > MAX_SKIPPED_ITEMS_LISTED {
-        println!("    ... and {} more", skipped.len() - MAX_SKIPPED_ITEMS_LISTED);
+        eprintln!("    ... and {} more", skipped.len() - MAX_SKIPPED_ITEMS_LISTED);
     }
-    println!();
+    eprintln!();
 }
 
 fn print_skipped_files(skipped: &[SkippedFile], root: &Path) {
@@ -596,15 +579,15 @@ fn print_skipped_files(skipped: &[SkippedFile], root: &Path) {
     crate::ui::formatter::print_warning_msg(&format!("{} files were skipped:", skipped.len()));
     for file in skipped.iter().take(MAX_SKIPPED_ITEMS_LISTED) {
         let shown_path = file.path.strip_prefix(root).unwrap_or(&file.path);
-        println!("    {} ({})", shown_path.display().to_string().dimmed(), file.reason.to_string().dimmed());
+        eprintln!("    {} ({})", shown_path.display().to_string().dimmed(), file.reason.to_string().dimmed());
     }
     if skipped.len() > MAX_SKIPPED_ITEMS_LISTED {
-        println!("    ... and {} more", skipped.len() - MAX_SKIPPED_ITEMS_LISTED);
+        eprintln!("    ... and {} more", skipped.len() - MAX_SKIPPED_ITEMS_LISTED);
     }
     if skipped.iter().any(|file| matches!(file.reason, SkipReason::TooLarge { .. })) {
-        println!("    {}", "Raise the size limit with `cbq index --max-file-size <KB>`.".dimmed());
+        eprintln!("    {}", "Raise the size limit with `cbq index --max-file-size <KB>`.".dimmed());
     }
-    println!();
+    eprintln!();
 }
 
 // Connects to Ollama and makes sure each model is downloaded, pulling any that are missing.
@@ -650,12 +633,91 @@ async fn ensure_model_available(ollama: &Ollama, model: &str) -> Result<(), anyh
 }
 
 fn open_project_index(directory: &Path, config: &Config) -> Result<(IndexedProject, rusqlite::Connection), anyhow::Error> {
+    let (project, conn) = locate_and_open_index(directory)?;
+    ensure_index_model_matches(&conn, &config.ollama.embedding_model)?;
+    Ok((project, conn))
+}
+
+fn locate_and_open_index(directory: &Path) -> Result<(IndexedProject, rusqlite::Connection), anyhow::Error> {
     let Some(project) = find_indexed_project(directory)? else {
         return Err(missing_index_error(directory));
     };
     let conn = open_index(&project.db_path)?;
-    ensure_index_model_matches(&conn, &config.ollama.embedding_model)?;
     Ok((project, conn))
+}
+
+fn show_history(directory: &Path, limit: usize) -> Result<(), anyhow::Error> {
+    let (project, conn) = locate_and_open_index(directory)?;
+    let turns = read_turns(&conn, limit)?;
+    if turns.is_empty() {
+        println!("No questions recorded for {} yet.", project.root.display());
+        print_legacy_history_note();
+        return Ok(());
+    }
+
+    crate::ui::formatter::print_section(&format!("Questions asked about {}", project.root.display()));
+    for turn in &turns {
+        let unanswered = match turn.answer {
+            None => "  (unanswered)".dimmed().to_string(),
+            Some(_) => String::new(),
+        };
+        println!(
+            "{} - \"{}\" ({} sources){}",
+            turn.asked_at.dimmed(),
+            turn.question.bold().yellow(),
+            turn.citations.len(),
+            unanswered
+        );
+    }
+
+    let total = count_turns(&conn)?;
+    if total > turns.len() {
+        println!("\nShowing the {} most recent of {} questions; use --limit to see more.", turns.len(), total);
+    }
+    print_legacy_history_note();
+    Ok(())
+}
+
+fn export_history(directory: &Path, output: Option<&Path>) -> Result<(), anyhow::Error> {
+    let (project, conn) = locate_and_open_index(directory)?;
+    let turns = read_turns(&conn, count_turns(&conn)?)?;
+    anyhow::ensure!(!turns.is_empty(), "No questions recorded for {} yet", project.root.display());
+
+    let export_path = match output {
+        Some(path) => path.to_path_buf(),
+        None => default_export_path(&project.root)?,
+    };
+    if let Some(parent) = export_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&export_path, render_transcript(&turns, &project.root))?;
+
+    crate::ui::formatter::print_success_msg(&format!(
+        "Exported {} to: {}",
+        count_of("question", turns.len()),
+        export_path.to_string_lossy().underline().yellow()
+    ));
+    Ok(())
+}
+
+fn count_of(noun: &str, count: usize) -> String {
+    match count {
+        1 => format!("1 {}", noun),
+        _ => format!("{} {}s", count, noun),
+    }
+}
+
+// History used to live in one global folder, where it can no longer be matched to a project.
+fn print_legacy_history_note() {
+    let Ok(legacy_dir) = cbq_home().map(|home| home.join("chats")) else {
+        return;
+    };
+    if legacy_dir.exists() {
+        println!(
+            "{}",
+            format!("Older history from before per-project history is still in {}.", legacy_dir.display()).dimmed()
+        );
+    }
 }
 
 fn missing_index_error(directory: &Path) -> anyhow::Error {
@@ -690,7 +752,7 @@ async fn run_search(query: &str, limit: Option<usize>, directory: &Path) {
     let (project, conn) = match open_project_index(directory, &config) {
         Ok(opened) => opened,
         Err(err) => {
-            eprintln!("{} {}", "Error:".red().bold(), err);
+            print_error(&format!("{}", err));
             std::process::exit(1);
         }
     };
@@ -699,7 +761,7 @@ async fn run_search(query: &str, limit: Option<usize>, directory: &Path) {
     let ollama = match prepare_ollama(&config, &models).await {
         Ok(ollama) => ollama,
         Err(err) => {
-            eprintln!("{} {:#}", "Error:".red().bold(), err);
+            print_error(&format!("{:#}", err));
             std::process::exit(1);
         }
     };
@@ -713,37 +775,49 @@ async fn run_search(query: &str, limit: Option<usize>, directory: &Path) {
     let query_vector = match ollama.embed(&config.ollama.embedding_model, query).await {
         Ok(vec) => vec,
         Err(err) => {
-            eprintln!("{} Failed to generate embedding for query: {}", "Error:".red().bold(), err);
+            print_error(&format!("Failed to generate embedding for query: {}", err));
             std::process::exit(1);
         }
     };
 
-    match search_codebase(&conn, &query_vector, limit, config.search.similarity_threshold) {
+    match search_codebase(&conn, &query_vector, limit) {
         Ok(results) => {
             if results.is_empty() {
-                println!("{}", "No relevant chunks found.".yellow());
+                println!("{}", "This project has no indexed chunks yet. Run `cbq index` first.".yellow());
                 return;
             }
-            print_search_results(&results);
+            print_search_results(&results, config.search.similarity_threshold);
 
             println!("{}", "🤖 [Ollama LLM Response]".blue().bold());
             let prompt = build_prompt(query, &results, &[]);
-            if let Err(e) = stream_answer(&ollama, &config.ollama.chat_model, &prompt).await {
-                eprintln!("\n{} Failed to get LLM response: {:#}", "Error:".red().bold(), e);
-            }
+            let answer = match stream_answer(&ollama, &config.ollama.chat_model, &prompt).await {
+                Ok(answer) => Some(answer),
+                Err(err) => {
+                    print_error(&format!("Failed to get LLM response: {:#}", err));
+                    None
+                }
+            };
             println!("\n");
 
-            if let Err(e) = save_chat(query, &results) {
-                eprintln!("Warning: Failed to save search history: {}", e);
+            let turn = RecordedTurn {
+                session_id: new_session_id(),
+                asked_at: now_timestamp(),
+                question: query.to_string(),
+                answer,
+                citations: citations_from(&results),
+            };
+            if let Err(err) = record_turn(&conn, &turn) {
+                print_warning_msg(&format!("Could not record this question: {}", err));
             }
         }
         Err(err) => {
-            eprintln!("{} Search failed: {}", "Error:".red().bold(), err);
+            print_error(&format!("Search failed: {}", err));
             std::process::exit(1);
         }
     }
 }
 
+// The answer is printed as it arrives; the spinner only covers the wait for the first words.
 async fn stream_answer(ollama: &Ollama, chat_model: &str, prompt: &str) -> Result<String, anyhow::Error> {
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(
@@ -756,11 +830,19 @@ async fn stream_answer(ollama: &Ollama, chat_model: &str, prompt: &str) -> Resul
     spinner.enable_steady_tick(Duration::from_millis(100));
 
     let mut answer = String::new();
-    let stream_result = ollama.generate_stream(chat_model, prompt, |chunk| answer.push_str(chunk)).await;
-    spinner.finish_and_clear();
+    let mut renderer = StreamingMarkdown::new();
+    let first_words = spinner.clone();
+    let stream_result = ollama
+        .generate_stream(chat_model, prompt, |chunk| {
+            first_words.finish_and_clear();
+            answer.push_str(chunk);
+            renderer.push(chunk);
+        })
+        .await;
 
+    spinner.finish_and_clear();
+    renderer.finish();
     stream_result?;
-    termimad::print_text(&answer);
     Ok(answer)
 }
 
@@ -781,7 +863,7 @@ async fn run_chat_repl(directory: &Path) -> Result<(), anyhow::Error> {
     println!("Checking Ollama connection...");
     let models = [config.ollama.embedding_model.as_str(), config.ollama.chat_model.as_str()];
     let ollama = prepare_ollama(&config, &models).await?;
-    let session = Session { config: &config, ollama: &ollama, conn: &conn };
+    let session = Session { config: &config, ollama: &ollama, conn: &conn, session_id: new_session_id() };
 
     println!("\n🤖 {}", format!("Codebase chat started for {}.", project.root.display()).cyan().bold());
     println!("Type 'exit' or 'quit' to end the session, or '/clear' to start a new conversation.");
@@ -816,7 +898,7 @@ async fn run_chat_repl(directory: &Path) -> Result<(), anyhow::Error> {
         match answer_chat_question(&session, &history, question).await {
             Ok(Some(answer)) => history.push(ChatTurn { question: question.to_string(), answer }),
             Ok(None) => {}
-            Err(err) => eprintln!("{} {:#}", "Error:".red().bold(), err),
+            Err(err) => print_error(&format!("{:#}", err)),
         }
     }
 
@@ -842,17 +924,16 @@ async fn answer_chat_question(
         .embed(&config.ollama.embedding_model, &search_query)
         .await
         .context("Failed to generate embedding")?;
-    let results = search_codebase(session.conn, &query_vector, config.search.top_k, config.search.similarity_threshold)
-        .context("Search failed")?;
+    let results = search_codebase(session.conn, &query_vector, config.search.top_k).context("Search failed")?;
 
     if results.is_empty() && history.is_empty() {
-        println!("{}", "No relevant chunks found for this query.".yellow());
+        println!("{}", "This project has no indexed chunks yet. Run `cbq index` first.".yellow());
         return Ok(None);
     }
     if results.is_empty() {
         println!("{}", "No new code matched; answering from the conversation so far.".dimmed());
     } else {
-        print_search_results(&results);
+        print_search_results(&results, config.search.similarity_threshold);
     }
 
     println!("{}", "🤖 [Ollama LLM Response]".blue().bold());
@@ -862,8 +943,15 @@ async fn answer_chat_question(
         .context("Failed to get LLM response")?;
     println!();
 
-    if let Err(e) = save_chat(question, &results) {
-        eprintln!("Warning: Failed to save search history: {}", e);
+    let turn = RecordedTurn {
+        session_id: session.session_id.clone(),
+        asked_at: now_timestamp(),
+        question: question.to_string(),
+        answer: Some(answer.clone()),
+        citations: citations_from(&results),
+    };
+    if let Err(err) = record_turn(session.conn, &turn) {
+        print_warning_msg(&format!("Could not record this question: {}", err));
     }
     Ok(Some(answer))
 }
@@ -878,7 +966,7 @@ async fn standalone_question(session: &Session<'_>, history: &[ChatTurn], questi
     let rewritten = match session.ollama.generate_deterministic(&session.config.ollama.chat_model, &prompt).await {
         Ok(rewritten) => rewritten,
         Err(err) => {
-            eprintln!("{} {}", "Warning: couldn't resolve the follow-up; searching for it as typed:".yellow(), err);
+            print_warning_msg(&format!("Couldn't resolve the follow-up, so searching for it as typed: {}", err));
             return question.to_string();
         }
     };
@@ -891,25 +979,34 @@ async fn standalone_question(session: &Session<'_>, history: &[ChatTurn], questi
     first_line.to_string()
 }
 
-fn print_search_results(results: &[SearchResult]) {
+fn print_search_results(results: &[SearchResult], confidence_threshold: f64) {
     println!("\n{} {} relevant chunks:\n", "🔍 Found".green(), results.len().to_string().yellow().bold());
 
     for (idx, result) in results.iter().enumerate() {
-        let path_str = result.chunk.file_path.display().to_string();
-        let is_test = path_str.contains("/test") || path_str.contains("test_") || path_str.starts_with("test");
-        let badge = if is_test { "🧪" } else { "📄" };
+        let badge = if is_test_file(&result.chunk.file_path) { "🧪" } else { "📄" };
+        let confidence = match result.score < confidence_threshold {
+            true => "  (low confidence)".dimmed().to_string(),
+            false => String::new(),
+        };
         println!(
-            "   {} {} {} {} [Score: {:.2}]",
+            "   {} {} {} {} [Score: {:.2}]{}",
             "└─".dimmed(),
             badge,
             (idx + 1).to_string().bold(),
             format!(
                 "{}:{}-{}",
-                path_str,
+                result.chunk.file_path.display(),
                 result.chunk.start_line,
                 result.chunk.end_line
             ).cyan(),
-            result.score
+            result.score,
+            confidence
+        );
+    }
+    if results.iter().all(|result| result.score < confidence_threshold) {
+        println!(
+            "   {}",
+            "Every match is weak, so the answer may not be grounded in your code.".yellow()
         );
     }
     println!();
@@ -992,7 +1089,7 @@ async fn run_analyze(directory: &Path, requested_source: Option<DiffSource>) -> 
 
     let related = match &index {
         Some((project, conn)) => {
-            let session = Session { config: &config, ollama: &ollama, conn };
+            let session = Session { config: &config, ollama: &ollama, conn, session_id: new_session_id() };
             find_related_code(&session, &files, &project.root).await?
         }
         None => Vec::new(),
@@ -1084,15 +1181,11 @@ async fn find_related_code(
             .embed(&session.config.ollama.embedding_model, &query)
             .await
             .context("Failed to embed a changed hunk")?;
-        let hits = search_codebase(
-            session.conn,
-            &query_vector,
-            RELATED_RESULTS_PER_HUNK,
-            session.config.search.similarity_threshold,
-        )
-        .context("Search failed")?;
+        let hits = search_codebase(session.conn, &query_vector, RELATED_RESULTS_PER_HUNK).context("Search failed")?;
+        // Weak matches are dropped here: unrelated code in the prompt would mislead the review.
         results.extend(hits.into_iter().filter(|hit| {
-            !changed_paths.iter().any(|path| is_changed_code(hit, path, hunk))
+            hit.score >= session.config.search.similarity_threshold
+                && !changed_paths.iter().any(|path| is_changed_code(hit, path, hunk))
         }));
     }
     let mut related = merge_related_code(results, MAX_RELATED_CHUNKS_IN_REVIEW);
@@ -1134,8 +1227,7 @@ fn build_prompt(query: &str, results: &[SearchResult], history: &[ChatTurn]) -> 
     let mut context_str = String::new();
     for (i, result) in results.iter().enumerate() {
         let path_str = result.chunk.file_path.display().to_string();
-        let is_test = path_str.contains("/test") || path_str.contains("test_") || path_str.starts_with("test");
-        let label = if is_test { "(TEST FILE)" } else { "(SOURCE FILE)" };
+        let label = if is_test_file(&result.chunk.file_path) { "(TEST FILE)" } else { "(SOURCE FILE)" };
         context_str.push_str(&format!(
             "--- Chunk {} {} ---\nFile: {}\nLines: {}-{}\n```\n{}\n```\n\n",
             i + 1,
@@ -1176,40 +1268,28 @@ fn build_prompt(query: &str, results: &[SearchResult], history: &[ChatTurn]) -> 
 }
 
 fn print_index_statistics(conn: &rusqlite::Connection, db_path: &Path) {
-    match get_db_stats(conn) {
-        Ok(stats) => {
-            crate::ui::formatter::print_section("Database Index Statistics");
-            println!("Location: {}", db_path.parent().unwrap().to_string_lossy().underline());
-            
-            let headers = vec!["Metric", "Value"];
-            
-            let mut lang_stmt = conn.prepare("SELECT DISTINCT file_path FROM chunks").unwrap();
-            let paths_iter = lang_stmt.query_map([], |row| row.get::<_, String>(0)).unwrap();
-            let mut languages = std::collections::HashSet::new();
-            for p_res in paths_iter {
-                if let Ok(p_str) = p_res {
-                    let p = std::path::Path::new(&p_str);
-                    if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
-                        languages.insert(ext.to_lowercase());
-                    }
-                }
-            }
-            let mut lang_vec: Vec<String> = languages.into_iter().collect();
-            lang_vec.sort();
-            
-            let file_size = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
-            let file_size_mb = format!("{:.2} MB", file_size as f64 / 1024.0 / 1024.0);
-
-            let rows = vec![
-                vec!["Total Code Chunks".to_string(), stats.total_chunks.to_string()],
-                vec!["Distinct Languages".to_string(), format!("{} ({})", lang_vec.len(), lang_vec.join(", "))],
-                vec!["Disk Footprint Size".to_string(), file_size_mb],
-            ];
-            
-            crate::ui::formatter::print_table(&headers, &rows);
-        }
+    let stats = match get_db_stats(conn) {
+        Ok(stats) => stats,
         Err(err) => {
-            eprintln!("{} Failed to retrieve database statistics: {}", "Error:".red().bold(), err);
+            print_error(&format!("Failed to read index statistics: {}", err));
+            return;
         }
+    };
+
+    crate::ui::formatter::print_section("Index Statistics");
+    if let Some(index_dir) = db_path.parent() {
+        println!("Location: {}", index_dir.to_string_lossy().underline());
     }
+
+    let size_bytes = std::fs::metadata(db_path).map(|file| file.len()).unwrap_or(0);
+    let rows = vec![
+        vec!["Indexed Files".to_string(), stats.indexed_files.to_string()],
+        vec!["Code Chunks".to_string(), stats.total_chunks.to_string()],
+        vec![
+            "Languages".to_string(),
+            format!("{} ({})", stats.file_extensions.len(), stats.file_extensions.join(", ")),
+        ],
+        vec!["Disk Footprint".to_string(), format!("{:.2} MB", size_bytes as f64 / 1024.0 / 1024.0)],
+    ];
+    crate::ui::formatter::print_table(&["Metric", "Value"], &rows);
 }

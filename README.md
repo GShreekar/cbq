@@ -14,7 +14,7 @@ No code is ever uploaded to the cloud—everything runs entirely on your local m
 - **Git Diff Impact Analysis**: Pipe `git diff` to `cbq` to receive a detailed analysis of your changes, including potential bugs, dependencies, and affected components.
 - **Intelligent Chunker**: Parses files using `tree-sitter` AST to chunk code cleanly into logical units (functions, classes, structures, modules) rather than naive line splitting.
 - **Model Auto-Provisioning**: Checks whether the configured models are on your Ollama server and pulls any that are missing, over Ollama's HTTP API, so Ollama running in Docker or on another machine works too.
-- **History & Export**: Review your query history or export chat transcripts to Markdown for documentation.
+- **History & Export**: Every question, its answer and the code it cited are recorded in that project's own index; review them with `cbq history` or export a Markdown transcript.
 
 ---
 
@@ -22,7 +22,7 @@ No code is ever uploaded to the cloud—everything runs entirely on your local m
 
 Before using `cbq`, ensure you have:
 
-1. **Rust & Cargo** (v1.70 or newer)
+1. **Rust & Cargo** (v1.85 or newer, for the 2024 edition)
 2. **Ollama** installed and running on your system.
    - [Download Ollama here](https://ollama.com/)
    - Make sure the Ollama server is running (usually on `http://localhost:11434`).
@@ -104,6 +104,10 @@ Once the codebase is indexed, you can run queries.
   ```bash
   cbq "How is the AST traversed?"
   ```
+  Answers stream into the terminal as the model writes them. Piping the output (`cbq search "..." > notes.md`) writes plain text instead of terminal formatting.
+
+  Results are always the best matches available, with their similarity scores shown. Matches scoring below `search.similarity_threshold` are marked `(low confidence)` rather than hidden, so a weak-but-useful hit is never silently dropped.
+
   The number of returned chunks defaults to `search.top_k` from your config; override it with `--limit`:
   ```bash
   cbq search "database initialization" --limit 3
@@ -135,18 +139,21 @@ Once the codebase is indexed, you can run queries.
 
 ---
 
-### 4. History and Logs
+### 4. History and Transcripts
 
-- **Display History**:
-  Shows a timestamped list of all queries you have run along with the number of matched code snippets.
+History is per project and lives in that project's index, so it stays with the codebase it belongs to.
+
+- **Show recent questions**:
   ```bash
-  cbq history
+  cbq history            # the 20 most recent, newest first
+  cbq history --limit 5
   ```
 
-- **Export Logs**:
-  Export all history logs to a Markdown file in your configuration directory.
+- **Export a transcript**:
+  Writes every question, the answer given, and the code each answer cited, grouped into the sessions they were asked in.
   ```bash
-  cbq export
+  cbq export                       # into ~/.cbq/exports/
+  cbq export --output notes.md
   ```
 
 ---
@@ -185,6 +192,8 @@ chat_model = "qwen2.5:1.5b"
 top_k = 5
 similarity_threshold = 0.5
 ```
+
+`similarity_threshold` marks weak matches in search results rather than hiding them; in `cbq analyze` it does filter, so unrelated code is kept out of the review.
 
 ---
 

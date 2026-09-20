@@ -21,7 +21,7 @@ mod tests {
 
     #[test]
     fn test_vector_bytes_roundtrip() {
-        let original = vec![0.15, -0.982, 3.14159, 42.0];
+        let original = vec![0.15, -0.982, 1.2345, 42.0];
         let bytes = vector_to_bytes(&original);
         let reconstructed = bytes_to_vector(&bytes);
         assert_eq!(original, reconstructed);

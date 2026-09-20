@@ -27,16 +27,19 @@ pub struct SearchConfig {
     pub similarity_threshold: f64,
 }
 
-pub fn get_config_path() -> Result<PathBuf, anyhow::Error> {
+/// Returns the directory holding every index, config file and export cbq writes.
+pub fn cbq_home() -> Result<PathBuf, anyhow::Error> {
     let home_dir = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .map(PathBuf::from)
         .map_err(|_| anyhow::anyhow!("Could not determine the home directory"))?;
+    Ok(home_dir.join(".cbq"))
+}
 
-    let qb_dir = home_dir.join(".cbq");
-    fs::create_dir_all(&qb_dir)?;
-
-    Ok(qb_dir.join("config.toml"))
+pub fn get_config_path() -> Result<PathBuf, anyhow::Error> {
+    let cbq_dir = cbq_home()?;
+    fs::create_dir_all(&cbq_dir)?;
+    Ok(cbq_dir.join("config.toml"))
 }
 
 pub fn load_config() -> Result<Config, anyhow::Error> {

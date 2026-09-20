@@ -232,6 +232,8 @@ async fn read_json_lines<T: DeserializeOwned>(
 ) -> Result<(), anyhow::Error> {
     let mut stream = response.bytes_stream();
     let mut buffer = Vec::new();
+    // Where the search for the next newline resumes, so a long line isn't rescanned on every chunk.
+    let mut scanned_to = 0;
 
     loop {
         let next = tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next())
@@ -240,12 +242,14 @@ async fn read_json_lines<T: DeserializeOwned>(
         let Some(bytes) = next else { break };
         buffer.extend_from_slice(&bytes?);
 
-        while let Some(newline) = buffer.iter().position(|&byte| byte == b'\n') {
-            let line: Vec<u8> = buffer.drain(..=newline).collect();
+        while let Some(offset) = buffer[scanned_to..].iter().position(|&byte| byte == b'\n') {
+            let line: Vec<u8> = buffer.drain(..=scanned_to + offset).collect();
+            scanned_to = 0;
             if let Some(data) = parse_stream_line(&line)? {
                 on_line(data);
             }
         }
+        scanned_to = buffer.len();
     }
     if let Some(data) = parse_stream_line(&buffer)? {
         on_line(data);
