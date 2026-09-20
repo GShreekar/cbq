@@ -10,11 +10,13 @@ use std::time::Duration;
 use anyhow::Context;
 use clap::Parser;
 use cli::args::{Cli, Commands};
-use services::chunker::CodeChunk;
+use services::chunker::{CodeChunk, CHUNK_FORMAT_VERSION};
+use services::embeddings::{document_prefix, embed_document, embed_query};
 use services::file_discovery::{discover_files, SkipReason, SkippedFile, DEFAULT_MAX_FILE_BYTES};
 use services::index_plan::{plan_index, read_source_file, IndexPlan, SourceFile};
 use services::parser::{parse_file, parse_source};
-use services::vector_search::{is_test_file, search_codebase, SearchResult};
+use services::vector_search::{is_test_file, SearchResult};
+use services::search::find_relevant_chunks;
 use services::chat_history::{
     citations_from, count_turns, default_export_path, new_session_id, now_timestamp, read_turns, record_turn,
     render_transcript, RecordedTurn,
@@ -27,7 +29,10 @@ use services::review::{
 use config::settings::{cbq_home, load_config, Config};
 use db::schema::{init_db, open_index};
 use db::location::{canonical_project_root, find_indexed_project, find_legacy_index, index_path_for, IndexedProject};
-use db::index_metadata::{ensure_index_model_matches, read_embedding_model, write_embedding_model};
+use db::index_metadata::{
+    ensure_index_model_matches, read_embedding_model, read_meta, write_embedding_model, write_meta,
+    CHUNK_FORMAT_KEY, DOCUMENT_PREFIX_KEY,
+};
 use db::queries::{
     delete_untracked_chunks, get_db_stats, has_chunks, read_file_hashes, remove_files, replace_file_chunks,
     reset_index, FileUpdate,
@@ -363,6 +368,8 @@ async fn run_index(path: &Path, force: bool, max_file_bytes: u64) -> Result<(), 
         Some(_) => reset_index(&mut conn, embedding_model)?,
         None => write_embedding_model(&conn, embedding_model)?,
     }
+    write_meta(&conn, CHUNK_FORMAT_KEY, &CHUNK_FORMAT_VERSION.to_string())?;
+    write_meta(&conn, DOCUMENT_PREFIX_KEY, document_prefix(embedding_model))?;
 
     println!("Parsing files...");
     let parsed_files = parse_planned_files(&plan);
@@ -395,11 +402,23 @@ fn rebuild_reason(conn: &rusqlite::Connection, config: &Config, force: bool) -> 
             "the embedding model changed from {} to {}",
             indexed_model, configured_model
         )),
-        Some(_) => None,
+        Some(_) => stored_format_reason(conn, configured_model)?,
         None if has_chunks(conn)? => Some("the index was built by an older cbq version".to_string()),
         None => None,
     };
     Ok(reason)
+}
+
+// Chunks and the text embedded from them must match what this version of cbq produces.
+fn stored_format_reason(conn: &rusqlite::Connection, model: &str) -> Result<Option<String>, anyhow::Error> {
+    let stored_format = read_meta(conn, CHUNK_FORMAT_KEY)?;
+    if stored_format.as_deref() != Some(&CHUNK_FORMAT_VERSION.to_string()) {
+        return Ok(Some("cbq now builds chunks differently".to_string()));
+    }
+    if read_meta(conn, DOCUMENT_PREFIX_KEY)?.as_deref() != Some(document_prefix(model)) {
+        return Ok(Some("the embedding prefix for this model changed".to_string()));
+    }
+    Ok(None)
 }
 
 fn read_source_files(paths: &[PathBuf], project_root: &Path) -> (Vec<SourceFile>, Vec<SkippedFile>) {
@@ -509,7 +528,7 @@ impl ChunkEmbedder<'_> {
     async fn embed(&mut self, chunks: Vec<CodeChunk>) -> Result<EmbeddedChunks, anyhow::Error> {
         let mut embedded = EmbeddedChunks::default();
         for chunk in chunks {
-            let result = self.ollama.embed(self.embedding_model, &chunk.content).await;
+            let result = embed_document(self.ollama, self.embedding_model, &chunk.embed_text()).await;
             self.progress.inc(1);
 
             match result {
@@ -772,7 +791,7 @@ async fn run_search(query: &str, limit: Option<usize>, directory: &Path) {
         query.cyan()
     );
 
-    let query_vector = match ollama.embed(&config.ollama.embedding_model, query).await {
+    let query_vector = match embed_query(&ollama, &config.ollama.embedding_model, query).await {
         Ok(vec) => vec,
         Err(err) => {
             print_error(&format!("Failed to generate embedding for query: {}", err));
@@ -780,7 +799,7 @@ async fn run_search(query: &str, limit: Option<usize>, directory: &Path) {
         }
     };
 
-    match search_codebase(&conn, &query_vector, limit) {
+    match find_relevant_chunks(&conn, query, &query_vector, limit) {
         Ok(results) => {
             if results.is_empty() {
                 println!("{}", "This project has no indexed chunks yet. Run `cbq index` first.".yellow());
@@ -919,12 +938,11 @@ async fn answer_chat_question(
         println!("{} {}", "↳ searching for:".dimmed(), search_query.dimmed());
     }
 
-    let query_vector = session
-        .ollama
-        .embed(&config.ollama.embedding_model, &search_query)
+    let query_vector = embed_query(session.ollama, &config.ollama.embedding_model, &search_query)
         .await
         .context("Failed to generate embedding")?;
-    let results = search_codebase(session.conn, &query_vector, config.search.top_k).context("Search failed")?;
+    let results = find_relevant_chunks(session.conn, &search_query, &query_vector, config.search.top_k)
+        .context("Search failed")?;
 
     if results.is_empty() && history.is_empty() {
         println!("{}", "This project has no indexed chunks yet. Run `cbq index` first.".yellow());
@@ -988,8 +1006,13 @@ fn print_search_results(results: &[SearchResult], confidence_threshold: f64) {
             true => "  (low confidence)".dimmed().to_string(),
             false => String::new(),
         };
+        // Ranking fuses similarity with keyword matching, so the scores shown aren't always descending.
+        let keywords = match result.matched_keywords {
+            true => "  (keyword match)".dimmed().to_string(),
+            false => String::new(),
+        };
         println!(
-            "   {} {} {} {} [Score: {:.2}]{}",
+            "   {} {} {} {} [Score: {:.2}]{}{}",
             "└─".dimmed(),
             badge,
             (idx + 1).to_string().bold(),
@@ -1000,6 +1023,7 @@ fn print_search_results(results: &[SearchResult], confidence_threshold: f64) {
                 result.chunk.end_line
             ).cyan(),
             result.score,
+            keywords,
             confidence
         );
     }
@@ -1176,12 +1200,11 @@ async fn find_related_code(
             continue; // the file lies outside the indexed directory
         }
         let query = format!("File: {}\n{}", file.path, hunk.text);
-        let query_vector = session
-            .ollama
-            .embed(&session.config.ollama.embedding_model, &query)
+        let query_vector = embed_query(session.ollama, &session.config.ollama.embedding_model, &query)
             .await
             .context("Failed to embed a changed hunk")?;
-        let hits = search_codebase(session.conn, &query_vector, RELATED_RESULTS_PER_HUNK).context("Search failed")?;
+        let hits = find_relevant_chunks(session.conn, &query, &query_vector, RELATED_RESULTS_PER_HUNK)
+            .context("Search failed")?;
         // Weak matches are dropped here: unrelated code in the prompt would mislead the review.
         results.extend(hits.into_iter().filter(|hit| {
             hit.score >= session.config.search.similarity_threshold

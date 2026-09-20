@@ -1,16 +1,43 @@
 use rusqlite::{Connection, OptionalExtension, params};
 use crate::services::ollama::is_same_model;
 
-const EMBEDDING_MODEL_KEY: &str = "embedding_model";
+pub const EMBEDDING_MODEL_KEY: &str = "embedding_model";
+/// The prefix the embedded text carried; changing it makes stored vectors incomparable.
+pub const DOCUMENT_PREFIX_KEY: &str = "document_prefix";
+/// How chunks were built; changing it means the stored text no longer matches what cbq would produce.
+pub const CHUNK_FORMAT_KEY: &str = "chunk_format";
+/// Which build of the keyword index the chunks were fed into.
+pub const KEYWORD_INDEX_KEY: &str = "keyword_index";
 
-/// Records which embedding model produced the vectors stored in an index.
-pub fn write_embedding_model(conn: &Connection, model: &str) -> Result<(), anyhow::Error> {
+/// Records a fact about how the index was built.
+pub fn write_meta(conn: &Connection, key: &str, value: &str) -> Result<(), anyhow::Error> {
     conn.execute(
         "INSERT INTO meta (key, value) VALUES (?1, ?2)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params![EMBEDDING_MODEL_KEY, model],
+        params![key, value],
     )?;
     Ok(())
+}
+
+/// Reads a fact about how the index was built, if it was recorded.
+pub fn read_meta(conn: &Connection, key: &str) -> Result<Option<String>, anyhow::Error> {
+    let has_meta_table: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_meta_table {
+        return Ok(None);
+    }
+    let value = conn
+        .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| row.get(0))
+        .optional()?;
+    Ok(value)
+}
+
+/// Records which embedding model produced the vectors stored in an index.
+pub fn write_embedding_model(conn: &Connection, model: &str) -> Result<(), anyhow::Error> {
+    write_meta(conn, EMBEDDING_MODEL_KEY, model)
 }
 
 /// Fails with re-index instructions if the index was built with a different embedding model.
@@ -30,18 +57,7 @@ pub fn ensure_index_model_matches(conn: &Connection, configured_model: &str) -> 
 
 /// Reads the embedding model an index was built with, if one was recorded.
 pub fn read_embedding_model(conn: &Connection) -> Result<Option<String>, anyhow::Error> {
-    let has_meta_table: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta')",
-        [],
-        |row| row.get(0),
-    )?;
-    if !has_meta_table {
-        return Ok(None);
-    }
-    let model = conn
-        .query_row("SELECT value FROM meta WHERE key = ?1", [EMBEDDING_MODEL_KEY], |row| row.get(0))
-        .optional()?;
-    Ok(model)
+    read_meta(conn, EMBEDDING_MODEL_KEY)
 }
 
 #[cfg(test)]

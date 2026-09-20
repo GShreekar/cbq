@@ -1,20 +1,54 @@
 use std::path::PathBuf;
 
-/// Largest chunk sent to the embedding model; Ollama's nomic-embed-text fails past ~4.5 KB of code.
+/// How chunks are built. Raising it makes cbq rebuild indexes whose chunks predate the change.
+pub const CHUNK_FORMAT_VERSION: u32 = 2;
+
+/// Largest text sent to the embedding model; Ollama's nomic-embed-text fails past ~4.5 KB.
 pub const MAX_CHUNK_BYTES: usize = 3_500;
+// The header naming the file, symbol and lines is added before embedding, so code gets a little less.
+const MAX_EMBED_HEADER_BYTES: usize = 400;
+const MAX_CONTENT_BYTES: usize = MAX_CHUNK_BYTES - MAX_EMBED_HEADER_BYTES;
 const MAX_CONTINUATION_HEADER_BYTES: usize = 300;
 
 #[derive(Debug, Clone)]
 pub struct CodeChunk {
     pub file_path: PathBuf,
+    pub language: String,
     pub name: String,
     pub chunk_type: String,
+    // The type, class or module this belongs to, when it belongs to one.
+    pub parent: Option<String>,
     pub content: String,
     pub start_line: usize,
     pub end_line: usize,
 }
 
-pub fn slice_by_lines(file_path: PathBuf, content: &str) -> Vec<CodeChunk> {
+impl CodeChunk {
+    /// The text that gets embedded: the code, behind a header saying where it comes from.
+    pub fn embed_text(&self) -> String {
+        format!(
+            "File: {}\nLanguage: {}\nSymbol: {} ({})\nParent: {}\nLines: {}-{}\n\n{}",
+            self.file_path.display(),
+            self.language,
+            self.name,
+            self.chunk_type,
+            self.parent.as_deref().unwrap_or("<module>"),
+            self.start_line,
+            self.end_line,
+            self.content
+        )
+    }
+
+    /// Names the chunk the way a reader would refer to it, such as `Cart::add`.
+    pub fn qualified_name(&self) -> String {
+        match &self.parent {
+            Some(parent) => format!("{}::{}", parent, self.name),
+            None => self.name.clone(),
+        }
+    }
+}
+
+pub fn slice_by_lines(file_path: PathBuf, language: &str, content: &str) -> Vec<CodeChunk> {
     let lines: Vec<&str> = content.lines().collect();
     let mut chunks = Vec::new();
     let chunk_size = 30;
@@ -28,8 +62,10 @@ pub fn slice_by_lines(file_path: PathBuf, content: &str) -> Vec<CodeChunk> {
 
         chunks.push(CodeChunk {
             file_path: file_path.clone(),
+            language: language.to_string(),
             name: format!("lines-{}-{}", start + 1, end),
             chunk_type: "general".to_string(),
+            parent: None,
             content: chunk_content,
             start_line: start + 1,
             end_line: end,
@@ -43,16 +79,16 @@ pub fn slice_by_lines(file_path: PathBuf, content: &str) -> Vec<CodeChunk> {
     chunks
 }
 
-/// Splits a chunk larger than MAX_CHUNK_BYTES into line-aligned pieces taken from the original source.
+/// Splits a chunk whose code exceeds the budget into line-aligned pieces taken from the original source.
 pub fn fit_to_byte_budget(chunk: CodeChunk, source_lines: &[&str]) -> Vec<CodeChunk> {
-    if chunk.content.len() <= MAX_CHUNK_BYTES {
+    if chunk.content.len() <= MAX_CONTENT_BYTES {
         return vec![chunk];
     }
 
     let last_line = chunk.end_line.min(source_lines.len());
     let lines = &source_lines[chunk.start_line - 1..last_line];
     let header = continuation_header(&chunk.name, lines);
-    let body_budget = MAX_CHUNK_BYTES - header.len();
+    let body_budget = MAX_CONTENT_BYTES - header.len();
 
     let mut pieces = Vec::new();
     let mut body = String::new();
@@ -89,8 +125,10 @@ fn build_piece(chunk: &CodeChunk, header: &str, body: &str, start_line: usize, e
     let content = if is_first { body.to_string() } else { format!("{}{}", header, body) };
     CodeChunk {
         file_path: chunk.file_path.clone(),
+        language: chunk.language.clone(),
         name: format!("{}-part-{}-{}", chunk.name, start_line, end_line),
         chunk_type: chunk.chunk_type.clone(),
+        parent: chunk.parent.clone(),
         content,
         start_line,
         end_line,
@@ -130,8 +168,10 @@ mod tests {
     fn chunk_spanning(lines: &[&str]) -> CodeChunk {
         CodeChunk {
             file_path: PathBuf::from("src/example.rs"),
+            language: "rust".to_string(),
             name: "example".to_string(),
             chunk_type: "function".to_string(),
+            parent: None,
             content: lines.join("\n"),
             start_line: 1,
             end_line: lines.len(),
@@ -152,7 +192,7 @@ mod tests {
         let lines = vec![line; 200];
         let pieces = fit_to_byte_budget(chunk_spanning(&lines), &lines);
         assert!(pieces.len() > 1);
-        assert!(pieces.iter().all(|piece| piece.content.len() <= MAX_CHUNK_BYTES));
+        assert!(pieces.iter().all(|piece| piece.embed_text().len() <= MAX_CHUNK_BYTES));
     }
 
     #[test]
@@ -180,7 +220,7 @@ mod tests {
         let lines = [minified.as_str()];
         let pieces = fit_to_byte_budget(chunk_spanning(&lines), &lines);
         assert!(pieces.len() > 1);
-        assert!(pieces.iter().all(|piece| piece.content.len() <= MAX_CHUNK_BYTES));
+        assert!(pieces.iter().all(|piece| piece.embed_text().len() <= MAX_CHUNK_BYTES));
     }
 
     #[test]
@@ -190,5 +230,28 @@ mod tests {
         let pieces = fit_to_byte_budget(chunk_spanning(&lines), &lines);
         let rejoined: String = pieces.iter().map(|piece| piece.content.lines().last().unwrap()).collect();
         assert_eq!(rejoined, wide);
+    }
+
+    #[test]
+    fn embed_text_names_the_file_symbol_and_parent() {
+        let mut chunk = chunk_spanning(&["fn add() {}"]);
+        chunk.name = "add".to_string();
+        chunk.parent = Some("Cart".to_string());
+        let embedded = chunk.embed_text();
+        assert!(embedded.starts_with("File: src/example.rs\nLanguage: rust\nSymbol: add (function)\nParent: Cart\n"));
+        assert!(embedded.ends_with("fn add() {}"));
+    }
+
+    #[test]
+    fn a_chunk_outside_any_type_has_no_parent_in_its_header() {
+        assert!(chunk_spanning(&["fn free() {}"]).embed_text().contains("Parent: <module>"));
+    }
+
+    #[test]
+    fn qualified_name_includes_the_parent_type() {
+        let mut chunk = chunk_spanning(&["fn add() {}"]);
+        chunk.name = "add".to_string();
+        chunk.parent = Some("Cart".to_string());
+        assert_eq!(chunk.qualified_name(), "Cart::add");
     }
 }

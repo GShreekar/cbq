@@ -38,16 +38,18 @@ pub fn replace_file_chunks(conn: &mut Connection, update: &FileUpdate) -> Result
 
     {
         let mut stmt = tx.prepare(
-            "INSERT INTO chunks (file_path, name, chunk_type, content, start_line, end_line, embedding)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+            "INSERT INTO chunks (file_path, language, name, chunk_type, parent, content, start_line, end_line, embedding)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
         )?;
 
         for (chunk, emb) in update.chunks.iter().zip(update.embeddings.iter()) {
             let emb_bytes = crate::services::embeddings::vector_to_bytes(emb);
             stmt.execute(params![
                 update.path,
+                chunk.language,
                 chunk.name,
                 chunk.chunk_type,
+                chunk.parent,
                 chunk.content,
                 chunk.start_line as i64,
                 chunk.end_line as i64,
@@ -91,6 +93,16 @@ pub fn delete_untracked_chunks(conn: &Connection) -> Result<usize, anyhow::Error
     Ok(conn.execute("DELETE FROM chunks WHERE file_path NOT IN (SELECT path FROM files)", [])?)
 }
 
+/// Returns the ids of chunks matching the keywords, best first, ranked by BM25.
+pub fn keyword_matches(conn: &Connection, keyword_query: &str, limit: usize) -> Result<Vec<i64>, anyhow::Error> {
+    // Names outweigh bodies: a query naming a symbol should find where it is defined.
+    let mut stmt = conn.prepare(
+        "SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ?1 ORDER BY bm25(chunks_fts, 10.0, 1.0, 2.0) LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![keyword_query, limit], |row| row.get(0))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
 /// A summary of what an index currently holds.
 pub struct DbStats {
     pub total_chunks: usize,
@@ -129,8 +141,10 @@ mod tests {
     fn chunk_in(path: &str) -> CodeChunk {
         CodeChunk {
             file_path: PathBuf::from(path),
+            language: "rust".to_string(),
             name: "chunk".to_string(),
             chunk_type: "function".to_string(),
+            parent: None,
             content: "fn chunk() {}".to_string(),
             start_line: 1,
             end_line: 1,

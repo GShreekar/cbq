@@ -9,10 +9,11 @@ No code is ever uploaded to the cloud—everything runs entirely on your local m
 ## Features
 
 - **Privacy First**: 100% local processing. No API keys, no cloud telemetry, and no code uploads.
-- **Semantic Code Search**: Find contextually and semantically relevant code using natural language.
+- **Hybrid Code Search**: Finds code by meaning (embeddings) and by exact wording (SQLite FTS5/BM25), merging both rankings so a plain-English question and a bare identifier both work.
 - **Code Chat (REPL)**: Talk directly to your codebase in an interactive chat session, maintaining context.
 - **Git Diff Impact Analysis**: Pipe `git diff` to `cbq` to receive a detailed analysis of your changes, including potential bugs, dependencies, and affected components.
-- **Intelligent Chunker**: Parses files using `tree-sitter` AST to chunk code cleanly into logical units (functions, classes, structures, modules) rather than naive line splitting.
+- **Intelligent Chunker**: Parses files with `tree-sitter` into logical units rather than line windows. Each chunk keeps the doc comments, decorators and attributes written above it; a type is indexed as a skeleton of its member signatures while each method is indexed on its own, so nothing is stored twice; functions assigned to a name (`const debounce = () => {}`) are indexed under that name; and every file gets a module chunk holding its imports, top-level constants and the list of symbols it defines.
+- **Context-Enriched Embeddings**: What gets embedded is the code behind a header naming its file, language, symbol and enclosing type, so a method called `add` is not just the word `add` in a vacuum.
 - **Model Auto-Provisioning**: Checks whether the configured models are on your Ollama server and pulls any that are missing, over Ollama's HTTP API, so Ollama running in Docker or on another machine works too.
 - **History & Export**: Every question, its answer and the code it cited are recorded in that project's own index; review them with `cbq history` or export a Markdown transcript.
 
@@ -85,6 +86,8 @@ To get started, you must index your codebase.
   ```
   *Note: The SQLite database is stored locally inside your home directory under `~/.cbq/codebases/<project-name>-<path-hash>/db.sqlite`, so projects that share a folder name keep separate indexes.*
 
+  Changing how cbq builds chunks, or switching embedding model, rebuilds the index automatically on the next run.
+
   Re-running `cbq index` only embeds files whose content changed since the last run, and drops files that were deleted; an unchanged project is up to date in well under a second, without contacting Ollama. Each file is saved as soon as it is embedded, so an interrupted run picks up where it stopped. Chunks that fail to embed are skipped, listed, and retried on the next run. Use `--force` to rebuild everything; changing `ollama.embedding_model` triggers a rebuild automatically.
 
   Indexing honors `.gitignore` (even outside a git repository), `.ignore`, and `.cbqignore` files, which use the same syntax for paths you want kept out of the index. It always skips version-control, dependency and build directories (`.git`, `node_modules`, `vendor`, `target`, `dist`, `build`, virtualenvs and similar), lockfiles, and minified `*.min.*` files. Files over 512 KB are skipped and listed; raise the limit with `cbq index --max-file-size <KB>`.
@@ -105,6 +108,8 @@ Once the codebase is indexed, you can run queries.
   cbq "How is the AST traversed?"
   ```
   Answers stream into the terminal as the model writes them. Piping the output (`cbq search "..." > notes.md`) writes plain text instead of terminal formatting.
+
+  Search combines two methods: embedding similarity for meaning, and keyword matching for exact names, error codes and string literals. Both rankings are merged with Reciprocal Rank Fusion, so a chunk found by either surfaces, and one found by both rises to the top.
 
   Results are always the best matches available, with their similarity scores shown. Matches scoring below `search.similarity_threshold` are marked `(low confidence)` rather than hidden, so a weak-but-useful hit is never silently dropped.
 

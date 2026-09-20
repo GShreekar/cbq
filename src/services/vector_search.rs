@@ -7,6 +7,8 @@ use std::path::PathBuf;
 pub struct SearchResult {
     pub chunk: CodeChunk,
     pub score: f64,
+    // True when keyword search found it, which is why results aren't ordered by score alone.
+    pub matched_keywords: bool,
 }
 
 // Tests describe behaviour rather than implement it, so they lose to source files at equal similarity.
@@ -30,61 +32,64 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
     (dot_product / (norm_a.sqrt() * norm_b.sqrt())) as f64
 }
 
-/// Returns the `limit` best-matching chunks, weakest matches included; callers judge them by score.
-pub fn search_codebase(
+/// A chunk scored against the query, with the row id that ranks it alongside keyword matches.
+pub struct ScoredChunk {
+    pub id: i64,
+    pub chunk: CodeChunk,
+    pub similarity: f64,
+}
+
+/// Scores every chunk in the index against the query vector.
+pub fn score_all_chunks(
     conn: &rusqlite::Connection,
     query_vector: &[f32],
-    limit: usize,
-) -> Result<Vec<SearchResult>, anyhow::Error> {
+) -> Result<Vec<ScoredChunk>, anyhow::Error> {
     let mut stmt = conn.prepare(
-        "SELECT file_path, name, chunk_type, content, start_line, end_line, embedding FROM chunks"
+        "SELECT id, file_path, language, name, chunk_type, parent, content, start_line, end_line, embedding FROM chunks"
     )?;
 
     let chunk_iter = stmt.query_map([], |row| {
-        let file_path_str: String = row.get(0)?;
-        let name: String = row.get(1)?;
-        let chunk_type: String = row.get(2)?;
-        let content: String = row.get(3)?;
-        let start_line: usize = row.get(4)?;
-        let end_line: usize = row.get(5)?;
-        let emb_bytes: Vec<u8> = row.get(6)?;
+        let chunk_id: i64 = row.get(0)?;
+        let file_path: String = row.get(1)?;
+        let embedding: Vec<u8> = row.get(9)?;
 
         Ok((
+            chunk_id,
             CodeChunk {
-                file_path: PathBuf::from(file_path_str),
-                name,
-                chunk_type,
-                content,
-                start_line,
-                end_line,
+                file_path: PathBuf::from(file_path),
+                language: row.get(2)?,
+                name: row.get(3)?,
+                chunk_type: row.get(4)?,
+                parent: row.get(5)?,
+                content: row.get(6)?,
+                start_line: row.get(7)?,
+                end_line: row.get(8)?,
             },
-            emb_bytes,
+            embedding,
         ))
     })?;
 
-    let mut results = Vec::new();
+    let mut scored = Vec::new();
     for item in chunk_iter {
-        if let Ok((chunk, bytes)) = item {
-            let chunk_vector = bytes_to_vector(&bytes);
-            if chunk_vector.len() != query_vector.len() {
-                return Err(anyhow::anyhow!(
-                    "The index stores {}-dimension vectors, but the query embedding has {}. \
-                     The embedding model changed since indexing; rebuild the index with `cbq index`.",
-                    chunk_vector.len(),
-                    query_vector.len()
-                ));
-            }
-            // Clamped first: penalising a negative similarity would move it towards zero, raising it.
-            let similarity = cosine_similarity(query_vector, &chunk_vector).clamp(0.0, 1.0);
-            let score = if is_test_file(&chunk.file_path) { similarity * TEST_FILE_PENALTY } else { similarity };
-            results.push(SearchResult { chunk, score });
+        let (id, chunk, bytes) = item?;
+        let chunk_vector = bytes_to_vector(&bytes);
+        if chunk_vector.len() != query_vector.len() {
+            return Err(anyhow::anyhow!(
+                "The index stores {}-dimension vectors, but the query embedding has {}. \
+                 The embedding model changed since indexing; rebuild the index with `cbq index`.",
+                chunk_vector.len(),
+                query_vector.len()
+            ));
         }
+        // Clamped first: penalising a negative similarity would move it towards zero, raising it.
+        let similarity = cosine_similarity(query_vector, &chunk_vector).clamp(0.0, 1.0);
+        let similarity = match is_test_file(&chunk.file_path) {
+            true => similarity * TEST_FILE_PENALTY,
+            false => similarity,
+        };
+        scored.push(ScoredChunk { id, chunk, similarity });
     }
-
-    results.sort_by(|a, b| b.score.total_cmp(&a.score));
-    results.truncate(limit);
-
-    Ok(results)
+    Ok(scored)
 }
 
 /// Reports whether a path looks like test code rather than the implementation.
@@ -129,24 +134,25 @@ mod tests {
     #[test]
     fn weak_matches_are_returned_rather_than_dropped() {
         let conn = index_with(&[("src/lib.rs", [0.30, 0.95, 0.0])]);
-        let results = search_codebase(&conn, &[1.0, 0.0, 0.0], 5).unwrap();
+        let results = score_all_chunks(&conn, &[1.0, 0.0, 0.0]).unwrap();
         assert_eq!(results.len(), 1);
-        assert!(results[0].score < 0.5, "expected a weak score, got {}", results[0].score);
+        assert!(results[0].similarity < 0.5, "expected a weak score, got {}", results[0].similarity);
     }
 
     #[test]
     fn opposite_vectors_score_zero_rather_than_negative() {
         let conn = index_with(&[("tests/lib_test.rs", [-1.0, 0.0, 0.0])]);
-        let results = search_codebase(&conn, &[1.0, 0.0, 0.0], 5).unwrap();
-        assert_eq!(results[0].score, 0.0);
+        let results = score_all_chunks(&conn, &[1.0, 0.0, 0.0]).unwrap();
+        assert_eq!(results[0].similarity, 0.0);
     }
 
     #[test]
     fn test_files_rank_below_source_files_that_match_equally_well() {
         let conn = index_with(&[("tests/cart_test.rs", [1.0, 0.0, 0.0]), ("src/cart.rs", [1.0, 0.0, 0.0])]);
-        let results = search_codebase(&conn, &[1.0, 0.0, 0.0], 5).unwrap();
+        let mut results = score_all_chunks(&conn, &[1.0, 0.0, 0.0]).unwrap();
+        results.sort_by(|a, b| b.similarity.total_cmp(&a.similarity));
         assert_eq!(results[0].chunk.file_path.to_string_lossy(), "src/cart.rs");
-        assert!(results[0].score > results[1].score);
+        assert!(results[0].similarity > results[1].similarity);
     }
 
     #[test]
@@ -158,6 +164,6 @@ mod tests {
              VALUES ('src/lib.rs', 'run', 'function', 'fn run() {}', 1, 1, ?1)",
             [crate::services::embeddings::vector_to_bytes(&[0.5; 768])],
         ).unwrap();
-        assert!(search_codebase(&conn, &[0.5; 1024], 5).is_err());
+        assert!(score_all_chunks(&conn, &[0.5; 1024]).is_err());
     }
 }

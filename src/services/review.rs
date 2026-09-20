@@ -156,13 +156,16 @@ mod tests {
         SearchResult {
             chunk: CodeChunk {
                 file_path: PathBuf::from(path),
+                language: "rust".to_string(),
                 name: "chunk".to_string(),
                 chunk_type: "function".to_string(),
+                parent: None,
                 content: "fn chunk() {}".to_string(),
                 start_line,
                 end_line,
             },
             score,
+            matched_keywords: false,
         }
     }
 
