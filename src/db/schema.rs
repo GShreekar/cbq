@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::Path;
 use rusqlite::{Connection, OpenFlags};
+use crate::config::settings::{cbq_home, restrict_to_owner};
 use crate::db::index_metadata::{read_meta, write_meta, KEYWORD_INDEX_KEY};
 
 // Bumping this rebuilds the keyword index, which also repairs one left inconsistent.
@@ -10,8 +11,12 @@ const KEYWORD_INDEX_VERSION: &str = "2-porter";
 pub fn init_db(db_path: &Path) -> Result<Connection, anyhow::Error> {
     if let Some(db_dir) = db_path.parent() {
         fs::create_dir_all(db_dir)?;
+        // An index holds the project's source code, so only its owner may read it.
+        restrict_to_owner(&cbq_home()?)?;
+        restrict_to_owner(db_dir)?;
     }
     let conn = Connection::open(db_path)?;
+    restrict_to_owner(db_path)?;
     create_tables(&conn)?;
     Ok(conn)
 }

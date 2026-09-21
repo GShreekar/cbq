@@ -6,6 +6,8 @@ pub const EMBEDDING_MODEL_KEY: &str = "embedding_model";
 pub const DOCUMENT_PREFIX_KEY: &str = "document_prefix";
 /// How chunks were built; changing it means the stored text no longer matches what cbq would produce.
 pub const CHUNK_FORMAT_KEY: &str = "chunk_format";
+/// The directory the index was built from, so `cbq list` can name it.
+pub const PROJECT_ROOT_KEY: &str = "project_root";
 /// Which build of the keyword index the chunks were fed into.
 pub const KEYWORD_INDEX_KEY: &str = "keyword_index";
 

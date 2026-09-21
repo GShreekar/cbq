@@ -47,6 +47,25 @@ pub fn find_legacy_index(start_dir: &Path) -> Result<Option<PathBuf>, anyhow::Er
     Ok(None)
 }
 
+/// Lists the directory of every index cbq has built.
+pub fn index_directories() -> Result<Vec<PathBuf>, anyhow::Error> {
+    let codebases = codebases_dir()?;
+    if !codebases.exists() {
+        return Ok(Vec::new());
+    }
+    let mut directories: Vec<PathBuf> = fs::read_dir(codebases)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.join(INDEX_FILE_NAME).exists())
+        .collect();
+    directories.sort();
+    Ok(directories)
+}
+
+/// Returns the index database inside an index directory.
+pub fn index_database_in(index_dir: &Path) -> PathBuf {
+    index_dir.join(INDEX_FILE_NAME)
+}
+
 fn codebases_dir() -> Result<PathBuf, anyhow::Error> {
     Ok(cbq_home()?.join("codebases"))
 }

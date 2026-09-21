@@ -46,6 +46,9 @@ pub enum Commands {
             default_value_t = 512
         )]
         max_file_size_kb: u64,
+
+        #[arg(long, help = "Index files that look like they hold credentials, which are skipped by default")]
+        allow_secrets: bool,
     },
     #[command(about = "Search the indexed codebase using keywords")]
     Search {
@@ -54,6 +57,24 @@ pub enum Commands {
 
         #[arg(help = "The maximum number of results to display [default: search.top_k from config]", short, long)]
         limit: Option<usize>,
+
+        #[arg(
+            short = 'C',
+            long,
+            help = "Project directory to use instead of the current one",
+            default_value = "."
+        )]
+        directory: PathBuf,
+    },
+    #[command(about = "List the projects cbq has indexed")]
+    List,
+    #[command(about = "Delete this project's index, or every index")]
+    Clean {
+        #[arg(long, help = "Delete every index, not just this project's")]
+        all: bool,
+
+        #[arg(short, long, help = "Delete without asking for confirmation")]
+        yes: bool,
 
         #[arg(
             short = 'C',

@@ -1,6 +1,6 @@
 use serde::{Serialize, Deserialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Config {
@@ -27,6 +27,9 @@ pub struct OllamaConfig {
     /// How many embedding requests may be in flight at once; raise it only if OLLAMA_NUM_PARALLEL is above 1.
     #[serde(default = "default_parallelism")]
     pub parallelism: usize,
+    /// Whether cbq may send code to an Ollama server that isn't on this machine.
+    #[serde(default)]
+    pub allow_remote: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -47,7 +50,24 @@ pub fn cbq_home() -> Result<PathBuf, anyhow::Error> {
 pub fn get_config_path() -> Result<PathBuf, anyhow::Error> {
     let cbq_dir = cbq_home()?;
     fs::create_dir_all(&cbq_dir)?;
+    restrict_to_owner(&cbq_dir)?;
     Ok(cbq_dir.join("config.toml"))
+}
+
+/// Makes a file or directory readable only by the user, since indexes hold their source code.
+pub fn restrict_to_owner(path: &Path) -> Result<(), anyhow::Error> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let owner_only = match path.is_dir() {
+            true => 0o700,
+            false => 0o600,
+        };
+        fs::set_permissions(path, fs::Permissions::from_mode(owner_only))?;
+    }
+    // Windows inherits the user profile's permissions, which are already per-user.
+    let _ = path;
+    Ok(())
 }
 
 pub fn load_config() -> Result<Config, anyhow::Error> {
@@ -64,6 +84,7 @@ pub fn load_config() -> Result<Config, anyhow::Error> {
 pub fn save_config(config: &Config) -> Result<(), anyhow::Error> {
     let path = get_config_path()?;
     let content = toml::to_string_pretty(config)?;
-    fs::write(path, content)?;
+    fs::write(&path, content)?;
+    restrict_to_owner(&path)?;
     Ok(())
 }

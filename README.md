@@ -8,7 +8,8 @@ No code is ever uploaded to the cloud—everything runs entirely on your local m
 
 ## Features
 
-- **Privacy First**: 100% local processing. No API keys, no cloud telemetry, and no code uploads.
+- **Privacy First**: Everything runs against Ollama on your own machine. No API keys, no telemetry, no uploads. Pointing `ollama.host` at another machine is refused unless you allow it explicitly, and warns on every run once you do.
+- **Keeps Credentials Out**: Files that look like credentials, and source files containing private keys or access tokens, are left out of the index and listed so you know.
 - **Hybrid Code Search**: Finds code by meaning (embeddings) and by exact wording (SQLite FTS5/BM25), merging both rankings so a plain-English question and a bare identifier both work.
 - **Code Chat (REPL)**: Talk directly to your codebase in an interactive chat session, maintaining context.
 - **Git Diff Impact Analysis**: Pipe `git diff` to `cbq` to receive a detailed analysis of your changes, including potential bugs, dependencies, and affected components.
@@ -16,6 +17,32 @@ No code is ever uploaded to the cloud—everything runs entirely on your local m
 - **Context-Enriched Embeddings**: What gets embedded is the code behind a header naming its file, language, symbol and enclosing type, so a method called `add` is not just the word `add` in a vacuum.
 - **Model Auto-Provisioning**: Checks whether the configured models are on your Ollama server and pulls any that are missing, over Ollama's HTTP API, so Ollama running in Docker or on another machine works too.
 - **History & Export**: Every question, its answer and the code it cited are recorded in that project's own index; review them with `cbq history` or export a Markdown transcript.
+
+---
+
+## What cbq stores, and where
+
+Indexes hold your source code, so `~/.cbq` and everything in it is created readable only by you
+(`0700` directories, `0600` files). See what exists and remove it with:
+
+```bash
+cbq list                 # every indexed project, with size and chunk count
+cbq clean                # delete this project's index
+cbq clean --all --yes    # delete every index, without being asked
+```
+
+Files whose names mark them as credentials (`.env*`, `*.pem`, `*.key`, `*credentials*.json`) and
+source files containing a private key, AWS key, GitHub or Slack token are skipped and reported.
+Index them anyway with `cbq index --allow-secrets`.
+
+cbq only ever talks to the Ollama server in your config. If that address is not on this machine,
+indexing and questions would send your code there, so cbq refuses until you say so:
+
+```bash
+cbq config set ollama.allow_remote true
+```
+
+After that it warns on every run, noting when the connection is unencrypted.
 
 ---
 
@@ -209,6 +236,7 @@ embedding_model = "nomic-embed-text"
 chat_model = "qwen2.5:1.5b"
 
 parallelism = 1
+allow_remote = false
 
 [search]
 top_k = 5

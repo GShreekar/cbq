@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use ignore::WalkBuilder;
 use crate::services::parser::extension_to_language_name;
+use crate::services::secrets::is_secret_file_name;
 
 /// Files larger than this are skipped unless the caller raises the limit; they're almost always generated.
 pub const DEFAULT_MAX_FILE_BYTES: u64 = 512 * 1024;
@@ -34,6 +35,7 @@ pub struct SkippedFile {
 pub enum SkipReason {
     TooLarge { size_bytes: u64, limit_bytes: u64 },
     Unreadable(String),
+    LooksLikeSecret(String),
 }
 
 impl std::fmt::Display for SkipReason {
@@ -46,12 +48,26 @@ impl std::fmt::Display for SkipReason {
                 limit_bytes / 1024
             ),
             SkipReason::Unreadable(reason) => write!(formatter, "{}", reason),
+            SkipReason::LooksLikeSecret(what) => write!(formatter, "looks like it holds {}", what),
         }
     }
 }
 
+/// What to leave out of a scan.
+pub struct DiscoveryOptions {
+    pub max_file_bytes: u64,
+    /// Index files whose names mark them as credentials; off by default.
+    pub allow_secrets: bool,
+}
+
+impl Default for DiscoveryOptions {
+    fn default() -> Self {
+        Self { max_file_bytes: DEFAULT_MAX_FILE_BYTES, allow_secrets: false }
+    }
+}
+
 /// Finds indexable source files under `root_path`, honoring .gitignore, .ignore and .cbqignore files.
-pub fn discover_files(root_path: &Path, max_file_bytes: u64) -> Result<FileDiscoveryResult, anyhow::Error> {
+pub fn discover_files(root_path: &Path, options: &DiscoveryOptions) -> Result<FileDiscoveryResult, anyhow::Error> {
     let mut result = FileDiscoveryResult {
         files: Vec::new(),
         extension_counts: HashMap::new(),
@@ -84,11 +100,20 @@ pub fn discover_files(root_path: &Path, max_file_bytes: u64) -> Result<FileDisco
             continue;
         };
 
-        let size = entry.metadata().map(|metadata| metadata.len()).unwrap_or(0);
-        if size > max_file_bytes {
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        if !options.allow_secrets && is_secret_file_name(&file_name) {
             result.skipped.push(SkippedFile {
                 path: entry.path().to_path_buf(),
-                reason: SkipReason::TooLarge { size_bytes: size, limit_bytes: max_file_bytes },
+                reason: SkipReason::LooksLikeSecret("credentials".to_string()),
+            });
+            continue;
+        }
+
+        let size = entry.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+        if size > options.max_file_bytes {
+            result.skipped.push(SkippedFile {
+                path: entry.path().to_path_buf(),
+                reason: SkipReason::TooLarge { size_bytes: size, limit_bytes: options.max_file_bytes },
             });
             continue;
         }
@@ -141,7 +166,7 @@ mod tests {
     }
 
     fn discovered_names(root: &Path) -> Vec<String> {
-        let mut names: Vec<String> = discover_files(root, DEFAULT_MAX_FILE_BYTES)
+        let mut names: Vec<String> = discover_files(root, &DiscoveryOptions::default())
             .unwrap()
             .files
             .iter()
@@ -222,8 +247,22 @@ mod tests {
     #[test]
     fn files_over_the_size_limit_are_reported_as_skipped() {
         let root = project_with(&[("src/big.rs", &"x".repeat(2048))]);
-        let result = discover_files(root.path(), 1024).unwrap();
+        let options = DiscoveryOptions { max_file_bytes: 1024, ..DiscoveryOptions::default() };
+        let result = discover_files(root.path(), &options).unwrap();
         assert_eq!(result.skipped[0].path, root.path().join("src/big.rs"));
+    }
+
+    #[test]
+    fn credential_files_are_left_out() {
+        let root = project_with(&[("src/lib.rs", "fn a() {}"), ("gcp-credentials.json", "{}")]);
+        assert_eq!(discovered_names(root.path()), vec!["src/lib.rs"]);
+    }
+
+    #[test]
+    fn credential_files_can_be_asked_for() {
+        let root = project_with(&[("gcp-credentials.json", "{}")]);
+        let options = DiscoveryOptions { allow_secrets: true, ..DiscoveryOptions::default() };
+        assert_eq!(discover_files(root.path(), &options).unwrap().files.len(), 1);
     }
 
     #[test]

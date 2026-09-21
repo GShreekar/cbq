@@ -101,6 +101,28 @@ impl Ollama {
         &self.base_url
     }
 
+    /// Reports whether the server runs on this machine, so nothing sent to it leaves the machine.
+    pub fn is_local(&self) -> bool {
+        let Ok(url) = reqwest::Url::parse(&self.base_url) else {
+            return false;
+        };
+        let Some(host) = url.host_str() else {
+            return false;
+        };
+        // A URL writes IPv6 addresses inside brackets.
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        if host.eq_ignore_ascii_case("localhost") {
+            return true;
+        }
+        host.parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback() || address.is_unspecified())
+    }
+
+    /// Reports whether traffic to the server is encrypted.
+    pub fn is_encrypted(&self) -> bool {
+        self.base_url.starts_with("https://")
+    }
+
     /// Lists the models on the server, which also confirms an Ollama server is answering here.
     pub async fn installed_models(&self) -> Result<Vec<String>, anyhow::Error> {
         let response = self
@@ -307,6 +329,19 @@ mod tests {
     #[test]
     fn host_with_trailing_slash_is_accepted() {
         assert_eq!(Ollama::new("http://localhost/", 11434).unwrap().address(), "http://localhost:11434");
+    }
+
+    #[test]
+    fn localhost_and_loopback_addresses_count_as_local() {
+        assert!(Ollama::new("http://localhost", 11434).unwrap().is_local());
+        assert!(Ollama::new("http://127.0.0.1", 11434).unwrap().is_local());
+        assert!(Ollama::new("http://[::1]", 11434).unwrap().is_local());
+    }
+
+    #[test]
+    fn another_machine_does_not_count_as_local() {
+        assert!(!Ollama::new("http://192.168.1.50", 11434).unwrap().is_local());
+        assert!(!Ollama::new("http://ollama.example.com", 11434).unwrap().is_local());
     }
 
     #[test]
