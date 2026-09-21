@@ -41,6 +41,20 @@ You can install `cbq` directly from [crates.io](https://crates.io):
 cargo install cbq
 ```
 
+  cbq talks to Ollama over plain HTTP, so it builds without OpenSSL. To point `ollama.host` at an
+  `https://` address, install with TLS support:
+
+  ```bash
+  cargo install cbq --features https
+  ```
+
+  Language grammars are downloaded on first use and cached under `~/.cache/tree-sitter-language-pack`.
+  To compile them in instead, so cbq never fetches anything at runtime, name the ones you want at build time:
+
+  ```bash
+  TSLP_LANGUAGES=rust,python,javascript,typescript,go cargo install cbq
+  ```
+
 ### From Source
 
 Alternatively, you can compile and install `cbq` locally:
@@ -183,6 +197,7 @@ Manage your configurations globally. Configurations are stored inside `~/.cbq/co
   cbq config set ollama.chat_model "llama3"
   cbq config set search.top_k 10
   cbq config set search.similarity_threshold 0.6
+  cbq config set ollama.parallelism 4
   ```
 
 #### Default Configurations
@@ -193,10 +208,16 @@ port = 11434
 embedding_model = "nomic-embed-text"
 chat_model = "qwen2.5:1.5b"
 
+parallelism = 1
+
 [search]
 top_k = 5
 similarity_threshold = 0.5
 ```
+
+`ollama.parallelism` is how many embedding requests cbq keeps in flight while indexing. One suits a
+server that works through requests serially, which is the default; raise it only if you have set
+`OLLAMA_NUM_PARALLEL` above 1 and have the GPU memory for it.
 
 `similarity_threshold` marks weak matches in search results rather than hiding them; in `cbq analyze` it does filter, so unrelated code is kept out of the review.
 

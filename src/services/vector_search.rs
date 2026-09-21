@@ -1,6 +1,6 @@
+use rayon::prelude::*;
 use crate::services::chunker::CodeChunk;
-use crate::services::embeddings::bytes_to_vector;
-use std::path::PathBuf;
+use crate::services::embeddings::{bytes_to_vector, normalise};
 
 /// A chunk found by search, scored from 0.0 (unrelated) to 1.0 (a perfect match).
 #[derive(Debug, Clone)]
@@ -12,84 +12,94 @@ pub struct SearchResult {
 }
 
 // Tests describe behaviour rather than implement it, so they lose to source files at equal similarity.
-const TEST_FILE_PENALTY: f64 = 0.8;
+const TEST_FILE_PENALTY: f32 = 0.8;
 
-pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
-    if a.len() != b.len() || a.is_empty() {
-        return 0.0;
-    }
-    let mut dot_product = 0.0;
-    let mut norm_a = 0.0;
-    let mut norm_b = 0.0;
-    for (val_a, val_b) in a.iter().zip(b.iter()) {
-        dot_product += val_a * val_b;
-        norm_a += val_a * val_a;
-        norm_b += val_b * val_b;
-    }
-    if norm_a == 0.0 || norm_b == 0.0 {
-        return 0.0;
-    }
-    (dot_product / (norm_a.sqrt() * norm_b.sqrt())) as f64
+/// Every chunk's vector, laid out end to end so scoring walks memory in one pass.
+pub struct ChunkVectors {
+    ids: Vec<i64>,
+    penalties: Vec<f32>,
+    values: Vec<f32>,
+    dimensions: usize,
 }
 
-/// A chunk scored against the query, with the row id that ranks it alongside keyword matches.
-pub struct ScoredChunk {
-    pub id: i64,
-    pub chunk: CodeChunk,
-    pub similarity: f64,
-}
-
-/// Scores every chunk in the index against the query vector.
-pub fn score_all_chunks(
-    conn: &rusqlite::Connection,
-    query_vector: &[f32],
-) -> Result<Vec<ScoredChunk>, anyhow::Error> {
-    let mut stmt = conn.prepare(
-        "SELECT id, file_path, language, name, chunk_type, parent, content, start_line, end_line, embedding FROM chunks"
-    )?;
-
-    let chunk_iter = stmt.query_map([], |row| {
-        let chunk_id: i64 = row.get(0)?;
+/// Loads every chunk's vector, leaving the source text in the database until the winners are known.
+pub fn load_chunk_vectors(conn: &rusqlite::Connection) -> Result<ChunkVectors, anyhow::Error> {
+    let mut stmt = conn.prepare("SELECT id, file_path, embedding FROM chunks")?;
+    let rows = stmt.query_map([], |row| {
+        let id: i64 = row.get(0)?;
         let file_path: String = row.get(1)?;
-        let embedding: Vec<u8> = row.get(9)?;
-
-        Ok((
-            chunk_id,
-            CodeChunk {
-                file_path: PathBuf::from(file_path),
-                language: row.get(2)?,
-                name: row.get(3)?,
-                chunk_type: row.get(4)?,
-                parent: row.get(5)?,
-                content: row.get(6)?,
-                start_line: row.get(7)?,
-                end_line: row.get(8)?,
-            },
-            embedding,
-        ))
+        let embedding: Vec<u8> = row.get(2)?;
+        Ok((id, file_path, embedding))
     })?;
 
-    let mut scored = Vec::new();
-    for item in chunk_iter {
-        let (id, chunk, bytes) = item?;
-        let chunk_vector = bytes_to_vector(&bytes);
-        if chunk_vector.len() != query_vector.len() {
-            return Err(anyhow::anyhow!(
+    let mut vectors = ChunkVectors { ids: Vec::new(), penalties: Vec::new(), values: Vec::new(), dimensions: 0 };
+    for row in rows {
+        let (id, file_path, embedding) = row?;
+        let vector = bytes_to_vector(&embedding);
+        if vectors.dimensions == 0 {
+            vectors.dimensions = vector.len();
+        }
+        if vector.len() != vectors.dimensions {
+            anyhow::bail!(
+                "The index mixes {}- and {}-dimension vectors; rebuild it with `cbq index --force`.",
+                vectors.dimensions,
+                vector.len()
+            );
+        }
+        vectors.ids.push(id);
+        vectors.penalties.push(match is_test_file(std::path::Path::new(&file_path)) {
+            true => TEST_FILE_PENALTY,
+            false => 1.0,
+        });
+        vectors.values.extend_from_slice(&vector);
+    }
+    Ok(vectors)
+}
+
+impl ChunkVectors {
+    /// Scores every chunk against the query and returns the best `count` of them, best first.
+    pub fn best_matches(&self, query_vector: &[f32], count: usize) -> Result<Vec<(i64, f64)>, anyhow::Error> {
+        let mut scored = self.score_all(query_vector)?;
+        if scored.len() > count {
+            // Only the leaders need ordering, so the rest are merely partitioned away.
+            scored.select_nth_unstable_by(count, |first, second| second.1.total_cmp(&first.1));
+            scored.truncate(count);
+        }
+        scored.sort_by(|first, second| second.1.total_cmp(&first.1));
+        Ok(scored)
+    }
+
+    /// Scores every chunk against the query, in the order they were loaded.
+    pub fn score_all(&self, query_vector: &[f32]) -> Result<Vec<(i64, f64)>, anyhow::Error> {
+        if self.ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if query_vector.len() != self.dimensions {
+            anyhow::bail!(
                 "The index stores {}-dimension vectors, but the query embedding has {}. \
                  The embedding model changed since indexing; rebuild the index with `cbq index`.",
-                chunk_vector.len(),
+                self.dimensions,
                 query_vector.len()
-            ));
+            );
         }
-        // Clamped first: penalising a negative similarity would move it towards zero, raising it.
-        let similarity = cosine_similarity(query_vector, &chunk_vector).clamp(0.0, 1.0);
-        let similarity = match is_test_file(&chunk.file_path) {
-            true => similarity * TEST_FILE_PENALTY,
-            false => similarity,
-        };
-        scored.push(ScoredChunk { id, chunk, similarity });
+
+        // Both sides are unit length, so their dot product is the cosine similarity.
+        let query = normalise(query_vector);
+        Ok(self
+            .values
+            .par_chunks(self.dimensions)
+            .enumerate()
+            .map(|(position, vector)| {
+                let similarity: f32 = vector.iter().zip(query.iter()).map(|(stored, asked)| stored * asked).sum();
+                let score = similarity.clamp(0.0, 1.0) * self.penalties[position];
+                (self.ids[position], score as f64)
+            })
+            .collect())
     }
-    Ok(scored)
+
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
 }
 
 /// Reports whether a path looks like test code rather than the implementation.
@@ -105,54 +115,55 @@ pub fn is_test_file(path: &std::path::Path) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_cosine_similarity() {
-        let a = vec![1.0, 0.0, 0.0];
-        let b = vec![1.0, 0.0, 0.0];
-        assert!((cosine_similarity(&a, &b) - 1.0).abs() < 1e-6);
-
-        let c = vec![0.0, 1.0, 0.0];
-        assert!((cosine_similarity(&a, &c) - 0.0).abs() < 1e-6);
-
-        let d = vec![-1.0, 0.0, 0.0];
-        assert!((cosine_similarity(&a, &d) - (-1.0)).abs() < 1e-6);
-    }
-
     fn index_with(chunks: &[(&str, [f32; 3])]) -> rusqlite::Connection {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         crate::db::schema::create_tables(&conn).unwrap();
         for (path, vector) in chunks {
             conn.execute(
-                "INSERT INTO chunks (file_path, name, chunk_type, content, start_line, end_line, embedding)
-                 VALUES (?1, 'chunk', 'function', 'fn chunk() {}', 1, 1, ?2)",
-                rusqlite::params![path, crate::services::embeddings::vector_to_bytes(vector)],
+                "INSERT INTO chunks (file_path, language, name, chunk_type, content, start_line, end_line, embedding)
+                 VALUES (?1, 'rust', 'chunk', 'function', 'fn chunk() {}', 1, 1, ?2)",
+                rusqlite::params![path, crate::services::embeddings::vector_to_bytes(&normalise(vector))],
             ).unwrap();
         }
         conn
     }
 
+    fn scores_of(conn: &rusqlite::Connection, query: &[f32]) -> Vec<(i64, f64)> {
+        load_chunk_vectors(conn).unwrap().best_matches(query, 10).unwrap()
+    }
+
     #[test]
     fn weak_matches_are_returned_rather_than_dropped() {
         let conn = index_with(&[("src/lib.rs", [0.30, 0.95, 0.0])]);
-        let results = score_all_chunks(&conn, &[1.0, 0.0, 0.0]).unwrap();
-        assert_eq!(results.len(), 1);
-        assert!(results[0].similarity < 0.5, "expected a weak score, got {}", results[0].similarity);
+        let scored = scores_of(&conn, &[1.0, 0.0, 0.0]);
+        assert_eq!(scored.len(), 1);
+        assert!(scored[0].1 < 0.5, "expected a weak score, got {}", scored[0].1);
     }
 
     #[test]
     fn opposite_vectors_score_zero_rather_than_negative() {
         let conn = index_with(&[("tests/lib_test.rs", [-1.0, 0.0, 0.0])]);
-        let results = score_all_chunks(&conn, &[1.0, 0.0, 0.0]).unwrap();
-        assert_eq!(results[0].similarity, 0.0);
+        assert_eq!(scores_of(&conn, &[1.0, 0.0, 0.0])[0].1, 0.0);
     }
 
     #[test]
     fn test_files_rank_below_source_files_that_match_equally_well() {
         let conn = index_with(&[("tests/cart_test.rs", [1.0, 0.0, 0.0]), ("src/cart.rs", [1.0, 0.0, 0.0])]);
-        let mut results = score_all_chunks(&conn, &[1.0, 0.0, 0.0]).unwrap();
-        results.sort_by(|a, b| b.similarity.total_cmp(&a.similarity));
-        assert_eq!(results[0].chunk.file_path.to_string_lossy(), "src/cart.rs");
-        assert!(results[0].similarity > results[1].similarity);
+        let scored = scores_of(&conn, &[1.0, 0.0, 0.0]);
+        assert_eq!(scored[0].0, 2, "the source file should rank first");
+        assert!(scored[0].1 > scored[1].1);
+    }
+
+    #[test]
+    fn an_unnormalised_query_still_scores_as_cosine_similarity() {
+        let conn = index_with(&[("src/cart.rs", [1.0, 0.0, 0.0])]);
+        assert!((scores_of(&conn, &[7.0, 0.0, 0.0])[0].1 - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn only_the_requested_number_of_matches_comes_back() {
+        let conn = index_with(&[("a.rs", [1.0, 0.0, 0.0]), ("b.rs", [0.0, 1.0, 0.0]), ("c.rs", [0.0, 0.0, 1.0])]);
+        assert_eq!(load_chunk_vectors(&conn).unwrap().best_matches(&[1.0, 1.0, 1.0], 2).unwrap().len(), 2);
     }
 
     #[test]
@@ -160,10 +171,17 @@ mod tests {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         crate::db::schema::create_tables(&conn).unwrap();
         conn.execute(
-            "INSERT INTO chunks (file_path, name, chunk_type, content, start_line, end_line, embedding)
-             VALUES ('src/lib.rs', 'run', 'function', 'fn run() {}', 1, 1, ?1)",
+            "INSERT INTO chunks (file_path, language, name, chunk_type, content, start_line, end_line, embedding)
+             VALUES ('src/lib.rs', 'rust', 'run', 'function', 'fn run() {}', 1, 1, ?1)",
             [crate::services::embeddings::vector_to_bytes(&[0.5; 768])],
         ).unwrap();
-        assert!(score_all_chunks(&conn, &[0.5; 1024]).is_err());
+        assert!(load_chunk_vectors(&conn).unwrap().best_matches(&[0.5; 1024], 5).is_err());
+    }
+
+    #[test]
+    fn an_empty_index_returns_no_matches() {
+        let conn = index_with(&[]);
+        assert!(load_chunk_vectors(&conn).unwrap().is_empty());
+        assert!(scores_of(&conn, &[1.0, 0.0, 0.0]).is_empty());
     }
 }

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 /// How chunks are built. Raising it makes cbq rebuild indexes whose chunks predate the change.
-pub const CHUNK_FORMAT_VERSION: u32 = 2;
+pub const CHUNK_FORMAT_VERSION: u32 = 3;
 
 /// Largest text sent to the embedding model; Ollama's nomic-embed-text fails past ~4.5 KB.
 pub const MAX_CHUNK_BYTES: usize = 3_500;

@@ -33,7 +33,7 @@ pub struct PullProgress {
 #[derive(Serialize)]
 struct EmbedRequest<'a> {
     model: &'a str,
-    input: &'a str,
+    input: &'a [String],
 }
 
 #[derive(Deserialize)]
@@ -73,13 +73,24 @@ impl Ollama {
     /// Creates a client for the server at `host`:`port`, rejecting addresses that aren't http(s) URLs.
     pub fn new(host: &str, port: u16) -> Result<Self, anyhow::Error> {
         let base_url = format!("{}:{}", host.trim_end_matches('/'), port);
-        let is_http_url = reqwest::Url::parse(&base_url)
-            .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.path() == "/");
-        if !is_http_url {
-            anyhow::bail!(
+        let scheme = reqwest::Url::parse(&base_url)
+            .ok()
+            .filter(|url| url.path() == "/")
+            .map(|url| url.scheme().to_string());
+
+        match scheme.as_deref() {
+            Some("http") => {}
+            // Building without TLS keeps OpenSSL out of the install; say so rather than fail at request time.
+            Some("https") if !cfg!(feature = "https") => anyhow::bail!(
+                "This build of cbq speaks plain HTTP only, so it cannot reach '{}'. \
+                 Reinstall with `cargo install cbq --features https` to allow https addresses.",
+                base_url
+            ),
+            Some("https") => {}
+            _ => anyhow::bail!(
                 "Invalid Ollama address '{}'. Set ollama.host to something like http://localhost",
                 base_url
-            );
+            ),
         }
         let http = reqwest::Client::builder().connect_timeout(CONNECT_TIMEOUT).build()?;
         Ok(Self { http, base_url })
@@ -90,8 +101,8 @@ impl Ollama {
         &self.base_url
     }
 
-    /// Confirms an Ollama server is answering at this address.
-    pub async fn check_running(&self) -> Result<(), anyhow::Error> {
+    /// Lists the models on the server, which also confirms an Ollama server is answering here.
+    pub async fn installed_models(&self) -> Result<Vec<String>, anyhow::Error> {
         let response = self
             .http
             .get(self.url("/api/tags"))
@@ -106,24 +117,11 @@ impl Ollama {
                 response.status()
             );
         }
-        response.json::<TagsResponse>().await.map_err(|_| {
+
+        let tags = response.json::<TagsResponse>().await.map_err(|_| {
             anyhow::anyhow!("{} answered, but not like an Ollama server; check ollama.host", self.base_url)
         })?;
-        Ok(())
-    }
-
-    /// Reports whether `model` is already downloaded on the server.
-    pub async fn has_model(&self, model: &str) -> Result<bool, anyhow::Error> {
-        let tags = self
-            .http
-            .get(self.url("/api/tags"))
-            .timeout(STATUS_TIMEOUT)
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<TagsResponse>()
-            .await?;
-        Ok(tags.models.iter().any(|installed| is_same_model(&installed.name, model)))
+        Ok(tags.models.into_iter().map(|model| model.name).collect())
     }
 
     /// Downloads `model` onto the server, reporting progress as it streams in.
@@ -145,21 +143,35 @@ impl Ollama {
         Ok(())
     }
 
-    /// Embeds `text` with `model`, truncating input longer than the model's context instead of failing.
-    pub async fn embed(&self, model: &str, text: &str) -> Result<Vec<f32>, anyhow::Error> {
+    /// Embeds several texts in one request, truncating input longer than the model's context instead of failing.
+    pub async fn embed_all(&self, model: &str, texts: &[String]) -> Result<Vec<Vec<f32>>, anyhow::Error> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
         let response = self
             .http
             .post(self.url("/api/embed"))
             .timeout(EMBED_TIMEOUT)
-            .json(&EmbedRequest { model, input: text })
+            .json(&EmbedRequest { model, input: texts })
             .send()
             .await?
             .error_for_status()?
             .json::<EmbedResponse>()
             .await?;
 
-        response
-            .embeddings
+        anyhow::ensure!(
+            response.embeddings.len() == texts.len(),
+            "Asked Ollama to embed {} texts but got {} vectors back",
+            texts.len(),
+            response.embeddings.len()
+        );
+        Ok(response.embeddings)
+    }
+
+    /// Embeds one text with `model`.
+    pub async fn embed(&self, model: &str, text: &str) -> Result<Vec<f32>, anyhow::Error> {
+        self.embed_all(model, std::slice::from_ref(&text.to_string()))
+            .await?
             .into_iter()
             .next()
             .ok_or_else(|| anyhow::anyhow!("Ollama returned no embedding for model '{}'", model))
@@ -305,6 +317,11 @@ mod tests {
     #[test]
     fn host_with_a_path_is_rejected() {
         assert!(Ollama::new("http://localhost/api", 11434).is_err());
+    }
+
+    #[test]
+    fn an_https_host_is_accepted_only_when_built_with_tls() {
+        assert_eq!(Ollama::new("https://ollama.example", 11434).is_ok(), cfg!(feature = "https"));
     }
 
     #[test]

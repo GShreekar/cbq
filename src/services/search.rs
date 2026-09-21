@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use rusqlite::Connection;
-use crate::db::queries::keyword_matches;
-use crate::services::vector_search::{score_all_chunks, SearchResult};
+use crate::db::queries::{chunks_by_ids, keyword_matches};
+use crate::services::vector_search::{ChunkVectors, SearchResult};
 
 // Reciprocal Rank Fusion, with the constant from Cormack et al. (2009): a chunk's score is the sum
 // of 1/(k + rank) over the rankings it appears in, so agreement between methods beats any single one.
@@ -20,30 +20,39 @@ const STOP_WORDS: [&str; 30] = [
 /// Finds the chunks most relevant to a question, combining embedding similarity with keyword matching.
 pub fn find_relevant_chunks(
     conn: &Connection,
+    vectors: &ChunkVectors,
     query_text: &str,
     query_vector: &[f32],
     limit: usize,
 ) -> Result<Vec<SearchResult>, anyhow::Error> {
-    let scored = score_all_chunks(conn, query_vector)?;
-
-    let mut by_similarity: Vec<(i64, f64)> = scored.iter().map(|chunk| (chunk.id, chunk.similarity)).collect();
-    by_similarity.sort_by(|first, second| second.1.total_cmp(&first.1));
-    let similar_ids: Vec<i64> = by_similarity.iter().take(CANDIDATES_PER_METHOD).map(|(id, _)| *id).collect();
+    if vectors.is_empty() {
+        return Ok(Vec::new());
+    }
+    let similar_ids: Vec<i64> = vectors
+        .best_matches(query_vector, CANDIDATES_PER_METHOD)?
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
 
     let keyword_ids = match to_keyword_query(query_text) {
         Some(keyword_query) => keyword_matches(conn, &keyword_query, CANDIDATES_PER_METHOD)?,
         None => Vec::new(),
     };
 
-    let mut chunks_by_id: HashMap<i64, _> = scored.into_iter().map(|chunk| (chunk.id, chunk)).collect();
-    Ok(fuse_rankings(&[&similar_ids, &keyword_ids], limit)
+    // Only the handful of chunks being returned need their source text fetched.
+    let ranked = fuse_rankings(&[&similar_ids, &keyword_ids], limit);
+    let mut chunks = chunks_by_ids(conn, &ranked)?;
+    let scores: HashMap<i64, f64> = vectors.score_all(query_vector)?.into_iter().collect();
+
+    Ok(ranked
         .into_iter()
-        .filter_map(|id| Some((id, chunks_by_id.remove(&id)?)))
-        // The score stays the embedding similarity, which is comparable across queries; the ranking is fused.
-        .map(|(id, chunk)| SearchResult {
-            chunk: chunk.chunk,
-            score: chunk.similarity,
-            matched_keywords: keyword_ids.contains(&id),
+        .filter_map(|id| {
+            Some(SearchResult {
+                chunk: chunks.remove(&id)?,
+                // The score stays the embedding similarity, comparable across queries; the ranking is fused.
+                score: *scores.get(&id)?,
+                matched_keywords: keyword_ids.contains(&id),
+            })
         })
         .collect())
 }

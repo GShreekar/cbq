@@ -12,6 +12,11 @@ fn default_chat_model() -> String {
     "qwen2.5:1.5b".to_string()
 }
 
+// One request at a time suits a single-GPU or CPU server, which processes them serially anyway.
+fn default_parallelism() -> usize {
+    1
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct OllamaConfig {
     pub host: String,
@@ -19,6 +24,9 @@ pub struct OllamaConfig {
     pub embedding_model: String,
     #[serde(default = "default_chat_model")]
     pub chat_model: String,
+    /// How many embedding requests may be in flight at once; raise it only if OLLAMA_NUM_PARALLEL is above 1.
+    #[serde(default = "default_parallelism")]
+    pub parallelism: usize,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

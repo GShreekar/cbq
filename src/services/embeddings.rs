@@ -1,8 +1,9 @@
 use crate::services::ollama::Ollama;
 
-/// Embeds a chunk for storage, with whatever prefix the model expects for documents.
-pub async fn embed_document(ollama: &Ollama, model: &str, text: &str) -> Result<Vec<f32>, anyhow::Error> {
-    ollama.embed(model, &format!("{}{}", document_prefix(model), text)).await
+/// Embeds chunks for storage, with whatever prefix the model expects for documents.
+pub async fn embed_documents(ollama: &Ollama, model: &str, texts: &[String]) -> Result<Vec<Vec<f32>>, anyhow::Error> {
+    let prefixed: Vec<String> = texts.iter().map(|text| format!("{}{}", document_prefix(model), text)).collect();
+    ollama.embed_all(model, &prefixed).await
 }
 
 /// Embeds a question, with whatever prefix the model expects for queries.
@@ -30,6 +31,15 @@ fn expects_task_prefixes(model: &str) -> bool {
     model.to_lowercase().contains("nomic-embed-text")
 }
 
+/// Scales a vector to length 1, so comparing two of them is a plain dot product.
+pub fn normalise(vector: &[f32]) -> Vec<f32> {
+    let length = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
+    if length == 0.0 {
+        return vector.to_vec();
+    }
+    vector.iter().map(|value| value / length).collect()
+}
+
 pub fn vector_to_bytes(vector: &[f32]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(vector.len() * 4);
     for val in vector {
@@ -50,6 +60,23 @@ pub fn bytes_to_vector(bytes: &[u8]) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_normalised_vector_has_length_one() {
+        let normalised = normalise(&[3.0, 4.0]);
+        let length: f32 = normalised.iter().map(|value| value * value).sum::<f32>().sqrt();
+        assert!((length - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn normalising_keeps_the_direction() {
+        assert_eq!(normalise(&[3.0, 4.0]), vec![0.6, 0.8]);
+    }
+
+    #[test]
+    fn an_all_zero_vector_is_left_alone() {
+        assert_eq!(normalise(&[0.0, 0.0]), vec![0.0, 0.0]);
+    }
 
     #[test]
     fn nomic_documents_and_queries_get_their_task_prefixes() {

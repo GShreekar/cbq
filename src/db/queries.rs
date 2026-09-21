@@ -1,5 +1,5 @@
 use std::collections::{BTreeSet, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection};
 use crate::db::index_metadata::write_embedding_model;
 use crate::services::chunker::CodeChunk;
@@ -43,7 +43,8 @@ pub fn replace_file_chunks(conn: &mut Connection, update: &FileUpdate) -> Result
         )?;
 
         for (chunk, emb) in update.chunks.iter().zip(update.embeddings.iter()) {
-            let emb_bytes = crate::services::embeddings::vector_to_bytes(emb);
+            // Stored ready to compare: scoring a query is then one multiply-add per dimension.
+            let emb_bytes = crate::services::embeddings::vector_to_bytes(&crate::services::embeddings::normalise(emb));
             stmt.execute(params![
                 update.path,
                 chunk.language,
@@ -93,6 +94,38 @@ pub fn delete_untracked_chunks(conn: &Connection) -> Result<usize, anyhow::Error
     Ok(conn.execute("DELETE FROM chunks WHERE file_path NOT IN (SELECT path FROM files)", [])?)
 }
 
+/// Fetches whole chunks by id, which is how search avoids loading source text it won't return.
+pub fn chunks_by_ids(conn: &Connection, ids: &[i64]) -> Result<HashMap<i64, CodeChunk>, anyhow::Error> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let placeholders = vec!["?"; ids.len()].join(",");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, file_path, language, name, chunk_type, parent, content, start_line, end_line
+         FROM chunks WHERE id IN ({})",
+        placeholders
+    ))?;
+
+    let rows = stmt.query_map(rusqlite::params_from_iter(ids), |row| {
+        let id: i64 = row.get(0)?;
+        let file_path: String = row.get(1)?;
+        Ok((
+            id,
+            CodeChunk {
+                file_path: PathBuf::from(file_path),
+                language: row.get(2)?,
+                name: row.get(3)?,
+                chunk_type: row.get(4)?,
+                parent: row.get(5)?,
+                content: row.get(6)?,
+                start_line: row.get(7)?,
+                end_line: row.get(8)?,
+            },
+        ))
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
 /// Returns the ids of chunks matching the keywords, best first, ranked by BM25.
 pub fn keyword_matches(conn: &Connection, keyword_query: &str, limit: usize) -> Result<Vec<i64>, anyhow::Error> {
     // Names outweigh bodies: a query naming a symbol should find where it is defined.
@@ -134,7 +167,6 @@ pub fn get_db_stats(conn: &Connection) -> Result<DbStats, anyhow::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use crate::db::schema::create_tables;
     use crate::services::chunker::CodeChunk;
 

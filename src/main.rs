@@ -11,12 +11,13 @@ use anyhow::Context;
 use clap::Parser;
 use cli::args::{Cli, Commands};
 use services::chunker::{CodeChunk, CHUNK_FORMAT_VERSION};
-use services::embeddings::{document_prefix, embed_document, embed_query};
+use services::embeddings::{document_prefix, embed_documents, embed_query};
 use services::file_discovery::{discover_files, SkipReason, SkippedFile, DEFAULT_MAX_FILE_BYTES};
 use services::index_plan::{plan_index, read_source_file, IndexPlan, SourceFile};
 use services::parser::{parse_file, parse_source};
-use services::vector_search::{is_test_file, SearchResult};
+use services::vector_search::{is_test_file, ChunkVectors, SearchResult};
 use services::search::find_relevant_chunks;
+use services::vector_search::load_chunk_vectors;
 use services::chat_history::{
     citations_from, count_turns, default_export_path, new_session_id, now_timestamp, read_turns, record_turn,
     render_transcript, RecordedTurn,
@@ -39,11 +40,14 @@ use db::queries::{
 };
 use ui::formatter::{print_error, print_warning_msg};
 use ui::stream::StreamingMarkdown;
+use rayon::prelude::*;
 use indicatif::{ProgressBar, ProgressStyle};
 use colored::Colorize;
 
 // A run of failures this long means Ollama or the model is broken, not individual chunks.
 const MAX_CONSECUTIVE_EMBEDDING_FAILURES: usize = 10;
+// Chunks embedded per request. Ollama works through them serially, so this saves round trips, not compute.
+const EMBEDDING_BATCH_CHUNKS: usize = 8;
 const MAX_SKIPPED_ITEMS_LISTED: usize = 5;
 const HISTORY_TURNS_IN_PROMPT: usize = 3;
 // Long answers are cut so a few turns of history can't crowd the code context out of the prompt.
@@ -64,6 +68,8 @@ struct Session<'a> {
     config: &'a Config,
     ollama: &'a Ollama,
     conn: &'a rusqlite::Connection,
+    // Loaded once: every question would otherwise re-read every vector in the index.
+    vectors: ChunkVectors,
     // Groups the questions asked in one chat session or one review.
     session_id: String,
 }
@@ -92,6 +98,7 @@ struct IndexOutcome {
 struct ChunkEmbedder<'a> {
     ollama: &'a Ollama,
     embedding_model: &'a str,
+    parallelism: usize,
     progress: ProgressBar,
     consecutive_failures: usize,
 }
@@ -240,6 +247,15 @@ async fn main() {
                                 std::process::exit(1);
                             }
                         }
+                        "ollama.parallelism" => {
+                            match value.parse::<usize>() {
+                                Ok(parallelism) if parallelism >= 1 => conf.ollama.parallelism = parallelism,
+                                _ => {
+                                    print_error("parallelism must be a whole number of 1 or more");
+                                    std::process::exit(1);
+                                }
+                            }
+                        }
                         "ollama.embedding_model" => {
                             if value != conf.ollama.embedding_model {
                                 println!(
@@ -376,7 +392,7 @@ async fn run_index(path: &Path, force: bool, max_file_bytes: u64) -> Result<(), 
     println!();
 
     println!("Generating embeddings...");
-    let outcome = embed_and_store(&ollama, embedding_model, &mut conn, parsed_files).await?;
+    let outcome = embed_and_store(&ollama, embedding_model, config.ollama.parallelism, &mut conn, parsed_files).await?;
     delete_untracked_chunks(&conn)?;
     println!();
     print_skipped_chunks(&outcome.skipped_chunks);
@@ -421,16 +437,24 @@ fn stored_format_reason(conn: &rusqlite::Connection, model: &str) -> Result<Opti
     Ok(None)
 }
 
+// Reading and hashing each file is independent work, so it runs across cores.
 fn read_source_files(paths: &[PathBuf], project_root: &Path) -> (Vec<SourceFile>, Vec<SkippedFile>) {
-    let mut source_files = Vec::new();
-    let mut unreadable_files = Vec::new();
-    for path in paths {
-        match read_source_file(path, project_root) {
-            Ok(source_file) => source_files.push(source_file),
-            Err(err) => unreadable_files.push(SkippedFile {
+    let read: Vec<Result<SourceFile, SkippedFile>> = paths
+        .par_iter()
+        .map(|path| {
+            read_source_file(path, project_root).map_err(|err| SkippedFile {
                 path: path.clone(),
                 reason: SkipReason::Unreadable(err.to_string()),
-            }),
+            })
+        })
+        .collect();
+
+    let mut source_files = Vec::new();
+    let mut unreadable_files = Vec::new();
+    for outcome in read {
+        match outcome {
+            Ok(source_file) => source_files.push(source_file),
+            Err(skipped) => unreadable_files.push(skipped),
         }
     }
     (source_files, unreadable_files)
@@ -463,26 +487,26 @@ fn parse_planned_files(plan: &IndexPlan) -> Vec<ParsedFile> {
             .progress_chars("██░")
     );
 
-    let mut parsed_files = Vec::new();
-    let mut chunk_count = 0;
-    for file in files {
-        // Chunks are labelled with the relative path, which is how the index and search results refer to files.
-        let parsed = parse_source(Path::new(&file.relative_path), &file.content);
-        if let Err(err) = &parsed {
-            parse_pb.suspend(|| print_warning_msg(&format!("Failed to parse {}: {}", file.relative_path, err)));
-        }
-        let parse_failed = parsed.is_err();
-        let chunks = parsed.unwrap_or_default();
-        chunk_count += chunks.len();
-        parsed_files.push(ParsedFile {
-            relative_path: file.relative_path.clone(),
-            content_hash: file.content_hash.clone(),
-            chunks,
-            parse_failed,
-        });
-        parse_pb.set_message(format!("{} chunks found", chunk_count));
-        parse_pb.inc(1);
-    }
+    // Parsing one file never depends on another, so the files are parsed across cores.
+    let parsed_files: Vec<ParsedFile> = files
+        .par_iter()
+        .map(|file| {
+            // Chunks are labelled with the relative path, which is how the index and results refer to files.
+            let parsed = parse_source(Path::new(&file.relative_path), &file.content);
+            if let Err(err) = &parsed {
+                parse_pb.suspend(|| print_warning_msg(&format!("Failed to parse {}: {}", file.relative_path, err)));
+            }
+            parse_pb.inc(1);
+            ParsedFile {
+                relative_path: file.relative_path.clone(),
+                content_hash: file.content_hash.clone(),
+                parse_failed: parsed.is_err(),
+                chunks: parsed.unwrap_or_default(),
+            }
+        })
+        .collect();
+
+    let chunk_count: usize = parsed_files.iter().map(|file| file.chunks.len()).sum();
     parse_pb.finish_with_message(format!("{} chunks found", chunk_count));
     parsed_files
 }
@@ -491,6 +515,7 @@ fn parse_planned_files(plan: &IndexPlan) -> Vec<ParsedFile> {
 async fn embed_and_store(
     ollama: &Ollama,
     embedding_model: &str,
+    parallelism: usize,
     conn: &mut rusqlite::Connection,
     files: Vec<ParsedFile>,
 ) -> Result<IndexOutcome, anyhow::Error> {
@@ -501,7 +526,7 @@ async fn embed_and_store(
             .unwrap()
             .progress_chars("██░")
     );
-    let mut embedder = ChunkEmbedder { ollama, embedding_model, progress, consecutive_failures: 0 };
+    let mut embedder = ChunkEmbedder { ollama, embedding_model, parallelism, progress, consecutive_failures: 0 };
 
     let mut outcome = IndexOutcome::default();
     for file in files {
@@ -527,47 +552,81 @@ impl ChunkEmbedder<'_> {
     // Chunks that fail on their own are skipped; a lost connection or a broken model stops the whole run.
     async fn embed(&mut self, chunks: Vec<CodeChunk>) -> Result<EmbeddedChunks, anyhow::Error> {
         let mut embedded = EmbeddedChunks::default();
-        for chunk in chunks {
-            let result = embed_document(self.ollama, self.embedding_model, &chunk.embed_text()).await;
-            self.progress.inc(1);
+        let batches: Vec<&[CodeChunk]> = chunks.chunks(EMBEDDING_BATCH_CHUNKS).collect();
 
-            match result {
-                Ok(embedding) => {
-                    self.consecutive_failures = 0;
-                    embedded.chunks.push(chunk);
-                    embedded.embeddings.push(embedding);
-                }
-                Err(err) if is_connection_failure(&err) => {
-                    anyhow::bail!(
-                        "Lost connection to Ollama at {}. Files finished so far were saved; \
-                         run `cbq index` again to continue.",
-                        self.ollama.address()
-                    );
-                }
-                Err(err) => {
-                    self.consecutive_failures += 1;
-                    if self.consecutive_failures == MAX_CONSECUTIVE_EMBEDDING_FAILURES {
-                        return Err(err.context(format!(
-                            "{} chunks in a row failed to embed. Files finished so far were saved; \
-                             run `cbq index` again once the model works",
-                            MAX_CONSECUTIVE_EMBEDDING_FAILURES
-                        )));
+        for group in batches.chunks(self.parallelism.max(1)) {
+            let sent = group.iter().map(|batch| self.embed_batch(batch));
+            for (batch, outcome) in group.iter().zip(futures_util::future::join_all(sent).await) {
+                match outcome {
+                    Ok(vectors) => {
+                        self.consecutive_failures = 0;
+                        self.progress.inc(batch.len() as u64);
+                        embedded.chunks.extend(batch.iter().cloned());
+                        embedded.embeddings.extend(vectors);
                     }
-                    embedded.skipped.push(format!(
-                        "{}:{}-{}: {}",
-                        chunk.file_path.display(),
-                        chunk.start_line,
-                        chunk.end_line,
-                        err
-                    ));
+                    Err(err) if is_connection_failure(&err) => {
+                        anyhow::bail!(
+                            "Lost connection to Ollama at {}. Files finished so far were saved; \
+                             run `cbq index` again to continue.",
+                            self.ollama.address()
+                        );
+                    }
+                    // One bad chunk shouldn't cost the whole batch, so the batch is retried one at a time.
+                    Err(_) => {
+                        for chunk in batch.iter() {
+                            self.embed_one(chunk, &mut embedded).await?;
+                        }
+                    }
                 }
             }
         }
         Ok(embedded)
     }
+
+    async fn embed_batch(&self, chunks: &[CodeChunk]) -> Result<Vec<Vec<f32>>, anyhow::Error> {
+        let texts: Vec<String> = chunks.iter().map(|chunk| chunk.embed_text()).collect();
+        embed_documents(self.ollama, self.embedding_model, &texts).await
+    }
+
+    async fn embed_one(&mut self, chunk: &CodeChunk, embedded: &mut EmbeddedChunks) -> Result<(), anyhow::Error> {
+        let result = self.embed_batch(std::slice::from_ref(chunk)).await;
+        self.progress.inc(1);
+
+        match result {
+            Ok(vectors) => {
+                self.consecutive_failures = 0;
+                embedded.chunks.push(chunk.clone());
+                embedded.embeddings.extend(vectors);
+            }
+            Err(err) if is_connection_failure(&err) => {
+                anyhow::bail!(
+                    "Lost connection to Ollama at {}. Files finished so far were saved; \
+                     run `cbq index` again to continue.",
+                    self.ollama.address()
+                );
+            }
+            Err(err) => {
+                self.consecutive_failures += 1;
+                if self.consecutive_failures == MAX_CONSECUTIVE_EMBEDDING_FAILURES {
+                    return Err(err.context(format!(
+                        "{} chunks in a row failed to embed. Files finished so far were saved; \
+                         run `cbq index` again once the model works",
+                        MAX_CONSECUTIVE_EMBEDDING_FAILURES
+                    )));
+                }
+                embedded.skipped.push(format!(
+                    "{}:{}-{}: {}",
+                    chunk.file_path.display(),
+                    chunk.start_line,
+                    chunk.end_line,
+                    err
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
-// Transport failures, including a server that dies mid-request; HTTP error statuses are chunk failures instead.
 fn is_connection_failure(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<reqwest::Error>()
@@ -612,15 +671,16 @@ fn print_skipped_files(skipped: &[SkippedFile], root: &Path) {
 // Connects to Ollama and makes sure each model is downloaded, pulling any that are missing.
 async fn prepare_ollama(config: &Config, models: &[&str]) -> Result<Ollama, anyhow::Error> {
     let ollama = Ollama::new(&config.ollama.host, config.ollama.port)?;
-    ollama.check_running().await?;
+    // One request answers both "is the server there?" and "which models does it have?".
+    let installed = ollama.installed_models().await?;
     for model in models {
-        ensure_model_available(&ollama, model).await?;
+        ensure_model_available(&ollama, model, &installed).await?;
     }
     Ok(ollama)
 }
 
-async fn ensure_model_available(ollama: &Ollama, model: &str) -> Result<(), anyhow::Error> {
-    if ollama.has_model(model).await? {
+async fn ensure_model_available(ollama: &Ollama, model: &str, installed: &[String]) -> Result<(), anyhow::Error> {
+    if installed.iter().any(|name| is_same_model(name, model)) {
         return Ok(());
     }
     println!(
@@ -799,7 +859,14 @@ async fn run_search(query: &str, limit: Option<usize>, directory: &Path) {
         }
     };
 
-    match find_relevant_chunks(&conn, query, &query_vector, limit) {
+    let vectors = match load_chunk_vectors(&conn) {
+        Ok(vectors) => vectors,
+        Err(err) => {
+            print_error(&format!("{}", err));
+            std::process::exit(1);
+        }
+    };
+    match find_relevant_chunks(&conn, &vectors, query, &query_vector, limit) {
         Ok(results) => {
             if results.is_empty() {
                 println!("{}", "This project has no indexed chunks yet. Run `cbq index` first.".yellow());
@@ -882,7 +949,8 @@ async fn run_chat_repl(directory: &Path) -> Result<(), anyhow::Error> {
     println!("Checking Ollama connection...");
     let models = [config.ollama.embedding_model.as_str(), config.ollama.chat_model.as_str()];
     let ollama = prepare_ollama(&config, &models).await?;
-    let session = Session { config: &config, ollama: &ollama, conn: &conn, session_id: new_session_id() };
+    let vectors = load_chunk_vectors(&conn)?;
+    let session = Session { config: &config, ollama: &ollama, conn: &conn, vectors, session_id: new_session_id() };
 
     println!("\n🤖 {}", format!("Codebase chat started for {}.", project.root.display()).cyan().bold());
     println!("Type 'exit' or 'quit' to end the session, or '/clear' to start a new conversation.");
@@ -941,7 +1009,7 @@ async fn answer_chat_question(
     let query_vector = embed_query(session.ollama, &config.ollama.embedding_model, &search_query)
         .await
         .context("Failed to generate embedding")?;
-    let results = find_relevant_chunks(session.conn, &search_query, &query_vector, config.search.top_k)
+    let results = find_relevant_chunks(session.conn, &session.vectors, &search_query, &query_vector, config.search.top_k)
         .context("Search failed")?;
 
     if results.is_empty() && history.is_empty() {
@@ -1113,7 +1181,8 @@ async fn run_analyze(directory: &Path, requested_source: Option<DiffSource>) -> 
 
     let related = match &index {
         Some((project, conn)) => {
-            let session = Session { config: &config, ollama: &ollama, conn, session_id: new_session_id() };
+            let vectors = load_chunk_vectors(conn)?;
+            let session = Session { config: &config, ollama: &ollama, conn, vectors, session_id: new_session_id() };
             find_related_code(&session, &files, &project.root).await?
         }
         None => Vec::new(),
@@ -1203,7 +1272,7 @@ async fn find_related_code(
         let query_vector = embed_query(session.ollama, &session.config.ollama.embedding_model, &query)
             .await
             .context("Failed to embed a changed hunk")?;
-        let hits = find_relevant_chunks(session.conn, &query, &query_vector, RELATED_RESULTS_PER_HUNK)
+        let hits = find_relevant_chunks(session.conn, &session.vectors, &query, &query_vector, RELATED_RESULTS_PER_HUNK)
             .context("Search failed")?;
         // Weak matches are dropped here: unrelated code in the prompt would mislead the review.
         results.extend(hits.into_iter().filter(|hit| {

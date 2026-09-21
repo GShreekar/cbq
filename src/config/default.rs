@@ -16,6 +16,7 @@ impl Default for OllamaConfig {
             port: 11434,
             embedding_model: "nomic-embed-text".to_string(),
             chat_model: "qwen2.5:1.5b".to_string(),
+            parallelism: 1,
         }
     }
 }
