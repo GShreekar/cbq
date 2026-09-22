@@ -61,6 +61,16 @@ pub fn index_directories() -> Result<Vec<PathBuf>, anyhow::Error> {
     Ok(directories)
 }
 
+/// Writes a relative path the way the index stores it: separated by forward slashes on every
+/// platform, so a path typed with `/` finds a file the walker reported with `\`.
+pub fn stored_path(relative: &Path) -> String {
+    relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Returns the index database inside an index directory.
 pub fn index_database_in(index_dir: &Path) -> PathBuf {
     index_dir.join(INDEX_FILE_NAME)
@@ -91,6 +101,24 @@ mod tests {
     #[test]
     fn project_key_starts_with_the_folder_name() {
         assert!(project_key(Path::new("/home/dev/cbq")).starts_with("cbq-"));
+    }
+
+    #[test]
+    fn a_stored_path_is_separated_by_forward_slashes() {
+        assert_eq!(stored_path(Path::new("src/services/cart.rs")), "src/services/cart.rs");
+    }
+
+    #[test]
+    fn a_single_file_is_stored_unchanged() {
+        assert_eq!(stored_path(Path::new("README.md")), "README.md");
+    }
+
+    // On Windows the walker reports `src\lib.rs`, while a person types `src/lib.rs`. Both are the
+    // same file, so both have to reach the index as the same string.
+    #[cfg(windows)]
+    #[test]
+    fn both_separators_reach_the_index_as_one_path() {
+        assert_eq!(stored_path(Path::new("src\\lib.rs")), stored_path(Path::new("src/lib.rs")));
     }
 
     #[test]

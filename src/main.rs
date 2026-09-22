@@ -38,7 +38,7 @@ use config::settings::{cbq_home, load_config, load_config_for, Config};
 use db::schema::{init_db, open_index};
 use db::location::{
     canonical_project_root, find_indexed_project, find_legacy_index, index_database_in, index_directories,
-    index_path_for, IndexedProject,
+    index_path_for, stored_path, IndexedProject,
 };
 use db::index_metadata::{
     ensure_index_model_matches, read_embedding_model, read_meta, write_embedding_model, write_meta,
@@ -898,8 +898,7 @@ fn to_indexed_path(project_root: &Path, directory: &Path, path: &str) -> Result<
         true => typed.to_path_buf(),
         false => canonical_project_root(directory)?.join(typed),
     };
-    let relative = absolute.strip_prefix(project_root).unwrap_or(typed);
-    Ok(relative.to_string_lossy().into_owned())
+    Ok(stored_path(absolute.strip_prefix(project_root).unwrap_or(typed)))
 }
 
 fn build_explain_prompt(

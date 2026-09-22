@@ -97,10 +97,15 @@ output. Everything runs against Ollama on your own machine, as before.
 - `cbq watch` no longer re-indexes in a loop: file access events are ignored, and only content and
   name changes count.
 - Counting rows in the full-text index no longer reports the source table's count.
+- Paths are stored in the index with forward slashes on every platform. On Windows the file walker
+  reports `src\lib.rs` while a person types `src/lib.rs`, so lookups by a typed path, `--json`
+  output and MCP clients passing a forward-slash path all missed files that were indexed.
 
 ### Notes
 
 - Minimum supported Rust version is now declared as 1.88, taken from the locked dependencies.
+- Windows is built and tested in CI for the first time. It compiles and the suite passes, but no
+  one has yet run cbq on Windows against a real project, so treat it as unproven.
 - cbq 1.1.0 reads indexes built by 1.0.1 by rebuilding them; run `cbq index` once after upgrading.
 
 ## [1.0.1] - 2026-06-25

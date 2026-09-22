@@ -30,8 +30,10 @@ jobs:
   windows:
     name: Test (windows, not yet verified)
     runs-on: windows-latest
-    # The unix-only paths are cfg-gated, but cbq has never been built on Windows. This job reports
-    # whether that holds without blocking a release until someone has confirmed it.
+    # Windows builds and the suite passes, but nobody has run cbq there against a real project.
+    # Drop continue-on-error once a green run has confirmed it, so regressions start failing.
+    #
+    # Keep this job: it is what caught paths being stored with the platform's separator.
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4

@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use crate::db::location::stored_path;
 use crate::services::git::{FileChange, FileDiff, Hunk};
 use crate::services::vector_search::SearchResult;
 
@@ -39,8 +40,7 @@ pub fn to_index_path(diff_path: &str, repository_root: Option<&Path>, index_root
     let Some(repository_root) = repository_root else {
         return Some(diff_path.to_string());
     };
-    let relative = repository_root.join(diff_path).strip_prefix(index_root).ok()?.to_path_buf();
-    Some(relative.to_string_lossy().into_owned())
+    Some(stored_path(repository_root.join(diff_path).strip_prefix(index_root).ok()?))
 }
 
 /// Converts an index path back into the diff's form, so the review names each file one way.

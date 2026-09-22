@@ -186,6 +186,7 @@ fn error_path(error: &ignore::Error, root_path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::location::stored_path;
     use std::fs;
 
     fn project_with(files: &[(&str, &str)]) -> tempfile::TempDir {
@@ -203,7 +204,7 @@ mod tests {
             .unwrap()
             .files
             .iter()
-            .map(|path| path.strip_prefix(root).unwrap().to_string_lossy().into_owned())
+            .map(|path| stored_path(path.strip_prefix(root).unwrap()))
             .collect();
         names.sort();
         names
@@ -297,7 +298,7 @@ mod tests {
             .unwrap()
             .files
             .iter()
-            .map(|path| path.strip_prefix(root.path()).unwrap().to_string_lossy().into_owned())
+            .map(|path| stored_path(path.strip_prefix(root.path()).unwrap()))
             .collect();
         assert_eq!(found, vec!["src/lib.rs"]);
     }
@@ -310,7 +311,7 @@ mod tests {
             .unwrap()
             .files
             .iter()
-            .map(|path| path.strip_prefix(root.path()).unwrap().to_string_lossy().into_owned())
+            .map(|path| stored_path(path.strip_prefix(root.path()).unwrap()))
             .collect();
         assert_eq!(found, vec!["src/lib.rs"]);
     }

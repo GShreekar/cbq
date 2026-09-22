@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 use crate::services::file_discovery::{SkipReason, SkippedFile};
+use crate::db::location::stored_path;
 use crate::services::hashing::fnv1a_hash;
 use crate::services::secrets::find_secret;
 
@@ -28,11 +29,7 @@ pub fn read_source_file(absolute_path: &Path, project_root: &Path) -> Result<Sou
     let bytes = fs::read(absolute_path)?;
     let content_hash = format!("{:016x}", fnv1a_hash(&bytes));
     let content = String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("not UTF-8 text"))?;
-    let relative_path = absolute_path
-        .strip_prefix(project_root)
-        .unwrap_or(absolute_path)
-        .to_string_lossy()
-        .into_owned();
+    let relative_path = stored_path(absolute_path.strip_prefix(project_root).unwrap_or(absolute_path));
     Ok(SourceFile {
         absolute_path: absolute_path.to_path_buf(),
         relative_path,
