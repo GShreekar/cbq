@@ -15,7 +15,8 @@ pub struct SourceFile {
 pub struct IndexPlan {
     pub new_files: Vec<SourceFile>,
     pub changed_files: Vec<SourceFile>,
-    pub unchanged_count: usize,
+    // Kept, not counted: the call graph is built from every file, not only the ones being embedded.
+    pub unchanged_files: Vec<SourceFile>,
     pub removed_paths: Vec<String>,
 }
 
@@ -50,13 +51,13 @@ pub fn plan_index(files: Vec<SourceFile>, recorded_hashes: &HashMap<String, Opti
     let mut plan = IndexPlan {
         new_files: Vec::new(),
         changed_files: Vec::new(),
-        unchanged_count: 0,
+        unchanged_files: Vec::new(),
         removed_paths,
     };
     for file in files {
         match recorded_hashes.get(&file.relative_path) {
             None => plan.new_files.push(file),
-            Some(Some(hash)) if *hash == file.content_hash => plan.unchanged_count += 1,
+            Some(Some(hash)) if *hash == file.content_hash => plan.unchanged_files.push(file),
             Some(_) => plan.changed_files.push(file),
         }
     }
@@ -67,6 +68,15 @@ impl IndexPlan {
     /// Every file that needs embedding, new ones first.
     pub fn files_to_index(&self) -> impl Iterator<Item = &SourceFile> {
         self.new_files.iter().chain(self.changed_files.iter())
+    }
+
+    /// Every file in the project, whether or not it needs embedding.
+    pub fn all_files(&self) -> impl Iterator<Item = &SourceFile> {
+        self.files_to_index().chain(self.unchanged_files.iter())
+    }
+
+    pub fn unchanged_count(&self) -> usize {
+        self.unchanged_files.len()
     }
 
     /// Reports whether the index already matches the files on disk.
@@ -95,7 +105,7 @@ mod tests {
     #[test]
     fn file_with_same_hash_is_unchanged() {
         let plan = plan_index(vec![source_file("src/lib.rs", "aaa")], &recorded(&[("src/lib.rs", Some("aaa"))]));
-        assert_eq!(plan.unchanged_count, 1);
+        assert_eq!(plan.unchanged_count(), 1);
     }
 
     #[test]

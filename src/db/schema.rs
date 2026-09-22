@@ -51,6 +51,14 @@ pub fn create_tables(conn: &Connection) -> Result<(), anyhow::Error> {
             path TEXT PRIMARY KEY,
             content_hash TEXT
         );
+        CREATE TABLE IF NOT EXISTS refs (
+            symbol_name TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            line INTEGER NOT NULL,
+            kind TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS refs_by_symbol ON refs(symbol_name);
+        CREATE INDEX IF NOT EXISTS refs_by_file ON refs(file_path);
         CREATE TABLE IF NOT EXISTS turns (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT NOT NULL,

@@ -9,6 +9,8 @@ pub struct SearchResult {
     pub score: f64,
     // True when keyword search found it, which is why results aren't ordered by score alone.
     pub matched_keywords: bool,
+    // True when it was pulled in because the results above call it.
+    pub found_via_calls: bool,
 }
 
 // Tests describe behaviour rather than implement it, so they lose to source files at equal similarity.

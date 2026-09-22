@@ -6,6 +6,28 @@ use crate::services::vector_search::SearchResult;
 const MAX_DIFF_CHARS_IN_PROMPT: usize = 16_000;
 const MAX_HUNK_CHARS_IN_PROMPT: usize = 4_000;
 
+/// A changed symbol and the places that call it, which is what a change can break elsewhere.
+pub struct ImpactedSymbol {
+    pub symbol: String,
+    pub callers: Vec<CallSite>,
+}
+
+pub struct CallSite {
+    pub file_path: String,
+    pub line: usize,
+    pub caller: Option<String>,
+}
+
+impl CallSite {
+    /// Reads as "src/main.rs:42 in run_search".
+    pub fn describe(&self) -> String {
+        match &self.caller {
+            Some(caller) => format!("{}:{} in {}", self.file_path, self.line, caller),
+            None => format!("{}:{}", self.file_path, self.line),
+        }
+    }
+}
+
 /// A prompt asking the chat model to review a diff, and how many hunks were left out to fit it.
 pub struct ReviewPrompt {
     pub text: String,
@@ -59,7 +81,11 @@ pub fn merge_related_code(results: Vec<SearchResult>, limit: usize) -> Vec<Searc
 }
 
 /// Builds the review prompt, leaving out whole hunks once the diff budget is spent.
-pub fn build_review_prompt(files: &[FileDiff], related: &[SearchResult]) -> ReviewPrompt {
+pub fn build_review_prompt(
+    files: &[FileDiff],
+    related: &[SearchResult],
+    impacted: &[ImpactedSymbol],
+) -> ReviewPrompt {
     let (diff_text, omitted_hunks) = render_diff(files);
     let omitted_note = if omitted_hunks > 0 {
         format!("({} more hunks were left out for length; don't speculate about them.)\n", omitted_hunks)
@@ -76,12 +102,13 @@ pub fn build_review_prompt(files: &[FileDiff], related: &[SearchResult]) -> Revi
         ## Summary\nOne or two sentences on what the change does.\n\
         ## Potential bugs\nConcrete problems the change introduces, citing file and line. \
         Write \"None found\" if there are none; never invent problems.\n\
-        ## Affected code\nPlaces in the related code that depend on the changed code and may need \
-        updating, citing file and line. Write \"None found\" if there are none.\n\
+        ## Affected code\nWhich of the listed callers, and which related code, may need updating for \
+        this change, citing file and line. Write \"None found\" if there are none.\n\
         ## Suggested checks\nSpecific tests or manual checks worth running.\n\n\
-        <diff>\n{}{}</diff>\n\n<related_code>\n{}</related_code>\n",
+        <diff>\n{}{}</diff>\n\n<callers>\n{}</callers>\n\n<related_code>\n{}</related_code>\n",
         diff_text,
         omitted_note,
+        render_impacted(impacted),
         render_related_code(related)
     );
     ReviewPrompt { text, omitted_hunks }
@@ -132,6 +159,20 @@ fn render_hunk(hunk: &Hunk) -> String {
     format!("{}{}\n... (rest of this hunk left out for length)\n", header, &hunk.text[..cut])
 }
 
+// Found by name in the index, not guessed by the model, so it can be trusted as a list of call sites.
+fn render_impacted(impacted: &[ImpactedSymbol]) -> String {
+    if impacted.is_empty() {
+        return "No callers of the changed symbols were found in the index.\n".to_string();
+    }
+    impacted
+        .iter()
+        .map(|symbol| {
+            let sites: Vec<String> = symbol.callers.iter().map(CallSite::describe).collect();
+            format!("{} is called from: {}\n", symbol.symbol, sites.join(", "))
+        })
+        .collect()
+}
+
 fn render_related_code(related: &[SearchResult]) -> String {
     related
         .iter()
@@ -166,6 +207,7 @@ mod tests {
             },
             score,
             matched_keywords: false,
+            found_via_calls: false,
         }
     }
 
@@ -243,23 +285,44 @@ mod tests {
     #[test]
     fn review_prompt_contains_the_diff_and_related_code() {
         let files = vec![modified_file("src/lib.rs", vec![hunk_at(1, 1, 1, 1, "-old\n+new\n")])];
-        let prompt = build_review_prompt(&files, &[result_at("src/main.rs", 3, 9, 0.7)]);
+        let prompt = build_review_prompt(&files, &[result_at("src/main.rs", 3, 9, 0.7)], &[]);
         assert!(prompt.text.contains("+new"));
         assert!(prompt.text.contains("--- src/main.rs:3-9 ---"));
+    }
+
+    #[test]
+    fn review_prompt_lists_the_callers_of_changed_symbols() {
+        let files = vec![modified_file("src/cart.rs", vec![hunk_at(1, 1, 1, 1, "-old\n+new\n")])];
+        let impacted = vec![ImpactedSymbol {
+            symbol: "compute_total".to_string(),
+            callers: vec![CallSite {
+                file_path: "src/checkout.rs".to_string(),
+                line: 5,
+                caller: Some("checkout".to_string()),
+            }],
+        }];
+        let prompt = build_review_prompt(&files, &[], &impacted);
+        assert!(prompt.text.contains("compute_total is called from: src/checkout.rs:5 in checkout"));
+    }
+
+    #[test]
+    fn review_prompt_says_so_when_nothing_calls_the_changed_code() {
+        let files = vec![modified_file("src/cart.rs", vec![hunk_at(1, 1, 1, 1, "-old\n+new\n")])];
+        assert!(build_review_prompt(&files, &[], &[]).text.contains("No callers of the changed symbols"));
     }
 
     #[test]
     fn hunks_beyond_the_budget_are_counted_as_omitted() {
         let big_hunk = format!("+{}\n", "x".repeat(MAX_HUNK_CHARS_IN_PROMPT - 10));
         let hunks = (0..6).map(|index| hunk_at(index * 10 + 1, 1, index * 10 + 1, 1, &big_hunk)).collect();
-        let prompt = build_review_prompt(&[modified_file("src/lib.rs", hunks)], &[]);
+        let prompt = build_review_prompt(&[modified_file("src/lib.rs", hunks)], &[], &[]);
         assert_eq!(prompt.omitted_hunks, 3);
     }
 
     #[test]
     fn oversized_hunk_is_truncated_rather_than_dropped() {
         let huge_hunk = format!("+{}\n", "x".repeat(MAX_DIFF_CHARS_IN_PROMPT * 2));
-        let prompt = build_review_prompt(&[modified_file("src/lib.rs", vec![hunk_at(1, 0, 1, 1, &huge_hunk)])], &[]);
+        let prompt = build_review_prompt(&[modified_file("src/lib.rs", vec![hunk_at(1, 0, 1, 1, &huge_hunk)])], &[], &[]);
         assert_eq!(prompt.omitted_hunks, 0);
         assert!(prompt.text.contains("rest of this hunk left out"));
     }

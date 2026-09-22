@@ -2,6 +2,7 @@ use std::fs;
 use std::path::Path;
 use tree_sitter::{Parser, Node};
 use crate::services::chunker::{CodeChunk, fit_to_byte_budget, slice_by_lines};
+use crate::services::symbols::{extract_references, Reference};
 
 /// Maps a lowercase file extension to its tree-sitter grammar name.
 pub fn extension_to_language_name(ext: &str) -> Option<&'static str> {
@@ -372,45 +373,54 @@ fn holds_a_function(node: Node) -> bool {
     })
 }
 
-pub fn parse_file(file_path: &Path) -> Result<Vec<CodeChunk>, anyhow::Error> {
+/// What one file contributes to the index: its chunks, and the names it uses.
+pub struct ParsedSource {
+    pub chunks: Vec<CodeChunk>,
+    pub references: Vec<Reference>,
+}
+
+pub fn parse_file(file_path: &Path) -> Result<ParsedSource, anyhow::Error> {
     let content = fs::read_to_string(file_path)?;
     parse_source(file_path, &content)
 }
 
-/// Splits already-read source into chunks, labelling each with `file_path`.
-pub fn parse_source(file_path: &Path, content: &str) -> Result<Vec<CodeChunk>, anyhow::Error> {
+/// Splits already-read source into chunks and collects the calls and imports it makes.
+pub fn parse_source(file_path: &Path, content: &str) -> Result<ParsedSource, anyhow::Error> {
     let extension = file_path.extension().and_then(|name| name.to_str()).unwrap_or("").to_lowercase();
     let language = extension_to_language_name(&extension);
 
-    let mut chunks = parse_syntax_chunks(file_path, content, language)?;
-    if chunks.is_empty() {
-        chunks = slice_by_lines(file_path.to_path_buf(), language.unwrap_or(&extension), content);
+    let mut parsed = parse_with_grammar(file_path, content, language)?;
+    if parsed.chunks.is_empty() {
+        parsed.chunks = slice_by_lines(file_path.to_path_buf(), language.unwrap_or(&extension), content);
     }
 
     let source_lines: Vec<&str> = content.lines().collect();
-    Ok(chunks
+    parsed.chunks = parsed
+        .chunks
         .into_iter()
         .flat_map(|chunk| fit_to_byte_budget(chunk, &source_lines))
-        .collect())
+        .collect();
+    Ok(parsed)
 }
 
-fn parse_syntax_chunks(
+fn parse_with_grammar(
     file_path: &Path,
     content: &str,
     language: Option<&'static str>,
-) -> Result<Vec<CodeChunk>, anyhow::Error> {
+) -> Result<ParsedSource, anyhow::Error> {
+    let empty = ParsedSource { chunks: Vec::new(), references: Vec::new() };
     let Some(language_name) = language else {
-        return Ok(Vec::new());
+        return Ok(empty);
     };
     // Grammars are fetched on first use; without one the file is still indexed by line windows.
     let Ok(grammar) = tree_sitter_language_pack::get_language(language_name) else {
-        return Ok(Vec::new());
+        return Ok(empty);
     };
 
     let mut parser = Parser::new();
     parser.set_language(&grammar)?;
     let Some(tree) = parser.parse(content, None) else {
-        return Ok(Vec::new());
+        return Ok(empty);
     };
 
     let context = ParseContext { source: content, file_path, language: language_name };
@@ -420,7 +430,8 @@ fn parse_syntax_chunks(
     if let Some(header) = module_header_chunk(tree.root_node(), &context, &chunks) {
         chunks.insert(0, header);
     }
-    Ok(chunks)
+    let references = extract_references(tree.root_node(), content, file_path);
+    Ok(ParsedSource { chunks, references })
 }
 
 #[cfg(test)]
@@ -429,7 +440,7 @@ mod tests {
 
     // These parse with real grammars, which the language pack fetches on first use.
     fn chunks_of(file_name: &str, source: &str) -> Vec<CodeChunk> {
-        parse_source(Path::new(file_name), source).unwrap()
+        parse_source(Path::new(file_name), source).unwrap().chunks
     }
 
     fn named<'a>(chunks: &'a [CodeChunk], name: &str) -> &'a CodeChunk {

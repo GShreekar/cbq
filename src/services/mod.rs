@@ -11,3 +11,4 @@ pub mod index_plan;
 pub mod review;
 pub mod search;
 pub mod secrets;
+pub mod symbols;

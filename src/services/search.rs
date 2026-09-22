@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use rusqlite::Connection;
-use crate::db::queries::{chunks_by_ids, keyword_matches};
+use crate::db::queries::{called_symbols_in_range, chunks_by_ids, find_definition_ids, keyword_matches};
 use crate::services::vector_search::{ChunkVectors, SearchResult};
 
 // Reciprocal Rank Fusion, with the constant from Cormack et al. (2009): a chunk's score is the sum
@@ -8,6 +8,10 @@ use crate::services::vector_search::{ChunkVectors, SearchResult};
 const RANK_FUSION_CONSTANT: f64 = 60.0;
 // How many candidates each method contributes before the two rankings are merged.
 const CANDIDATES_PER_METHOD: usize = 50;
+// How many of the best results are followed into the calls they make, and how many definitions
+// that may add. Kept small: these are extra context, not answers in their own right.
+const RESULTS_EXPANDED_THROUGH_CALLS: usize = 3;
+const MAX_DEFINITIONS_PULLED_IN: usize = 2;
 // One- and two-letter words match nearly everything, so they only dilute the keyword ranking.
 const MIN_KEYWORD_LENGTH: usize = 3;
 // Words that carry no signal about which code is wanted, and would otherwise match every file of prose.
@@ -44,17 +48,54 @@ pub fn find_relevant_chunks(
     let mut chunks = chunks_by_ids(conn, &ranked)?;
     let scores: HashMap<i64, f64> = vectors.score_all(query_vector)?.into_iter().collect();
 
-    Ok(ranked
-        .into_iter()
+    let mut results: Vec<SearchResult> = ranked
+        .iter()
         .filter_map(|id| {
             Some(SearchResult {
-                chunk: chunks.remove(&id)?,
+                chunk: chunks.remove(id)?,
                 // The score stays the embedding similarity, comparable across queries; the ranking is fused.
-                score: *scores.get(&id)?,
-                matched_keywords: keyword_ids.contains(&id),
+                score: *scores.get(id)?,
+                matched_keywords: keyword_ids.contains(id),
+                found_via_calls: false,
             })
         })
-        .collect())
+        .collect();
+
+    // Added after the ranked results rather than in place of them, so nothing better is pushed out.
+    for definition in definitions_called_by(conn, &results, &ranked)? {
+        let id = definition.0;
+        results.push(SearchResult {
+            chunk: definition.1,
+            score: scores.get(&id).copied().unwrap_or(0.0),
+            matched_keywords: false,
+            found_via_calls: true,
+        });
+    }
+    Ok(results)
+}
+
+// A function is hard to explain without the functions it calls, which search alone rarely returns.
+fn definitions_called_by(
+    conn: &Connection,
+    results: &[SearchResult],
+    already_included: &[i64],
+) -> Result<Vec<(i64, crate::services::chunker::CodeChunk)>, anyhow::Error> {
+    let mut wanted: Vec<i64> = Vec::new();
+    for result in results.iter().take(RESULTS_EXPANDED_THROUGH_CALLS) {
+        let file_path = result.chunk.file_path.to_string_lossy().into_owned();
+        let called = called_symbols_in_range(conn, &file_path, result.chunk.start_line, result.chunk.end_line)?;
+        for symbol in called {
+            for id in find_definition_ids(conn, &symbol)? {
+                if !already_included.contains(&id) && !wanted.contains(&id) {
+                    wanted.push(id);
+                }
+            }
+        }
+    }
+
+    wanted.truncate(MAX_DEFINITIONS_PULLED_IN);
+    let mut chunks = chunks_by_ids(conn, &wanted)?;
+    Ok(wanted.into_iter().filter_map(|id| Some((id, chunks.remove(&id)?))).collect())
 }
 
 /// Merges rankings so that a chunk ranked well by either method rises, and one ranked well by both rises further.

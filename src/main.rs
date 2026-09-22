@@ -15,10 +15,10 @@ use services::embeddings::{document_prefix, embed_documents, embed_query};
 use services::file_discovery::{discover_files, DiscoveryOptions, SkipReason, SkippedFile};
 use services::index_plan::{plan_index, read_source_file, IndexPlan, SourceFile};
 use services::parser::{parse_file, parse_source};
-use services::vector_search::{is_test_file, ChunkVectors, SearchResult};
+use services::symbols::Reference;
+use services::vector_search::{is_test_file, load_chunk_vectors, ChunkVectors, SearchResult};
 use services::search::find_relevant_chunks;
 use services::secrets::find_secret;
-use services::vector_search::load_chunk_vectors;
 use services::chat_history::{
     citations_from, count_turns, default_export_path, new_session_id, now_timestamp, read_turns, record_turn,
     render_transcript, RecordedTurn,
@@ -27,6 +27,7 @@ use services::ollama::{is_same_model, Ollama};
 use services::git::{find_repository_root, parse_diff, read_git_diff, DiffSource, FileChange, FileDiff, Hunk};
 use services::review::{
     build_review_prompt, describe_change, is_changed_code, merge_related_code, to_diff_path, to_index_path,
+    CallSite, ImpactedSymbol,
 };
 use config::settings::{cbq_home, load_config, Config};
 use db::schema::{init_db, open_index};
@@ -36,10 +37,11 @@ use db::location::{
 };
 use db::index_metadata::{
     ensure_index_model_matches, read_embedding_model, read_meta, write_embedding_model, write_meta,
-    CHUNK_FORMAT_KEY, DOCUMENT_PREFIX_KEY, PROJECT_ROOT_KEY,
+    CHUNK_FORMAT_KEY, DOCUMENT_PREFIX_KEY, GRAPH_VERSION_KEY, PROJECT_ROOT_KEY,
 };
 use db::queries::{
-    delete_untracked_chunks, get_db_stats, has_chunks, read_file_hashes, remove_files, replace_file_chunks,
+    delete_untracked_chunks, enclosing_symbol, find_definitions, find_references, get_db_stats, has_chunks,
+    find_symbols_in_range, read_file_hashes, remove_files, replace_all_references, replace_file_chunks,
     reset_index, FileUpdate,
 };
 use ui::formatter::{print_error, print_warning_msg};
@@ -61,6 +63,9 @@ const MAX_HUNKS_SEARCHED: usize = 20;
 // More than will be kept, because hits on the changed code itself are filtered out afterwards.
 const RELATED_RESULTS_PER_HUNK: usize = 6;
 const MAX_RELATED_CHUNKS_IN_REVIEW: usize = 4;
+// Enough to show the blast radius without burying the review in call sites.
+const MAX_IMPACTED_SYMBOLS: usize = 10;
+const MAX_CALLERS_PER_SYMBOL: usize = 8;
 
 struct ChatTurn {
     question: String,
@@ -89,6 +94,7 @@ struct ParsedFile {
     relative_path: String,
     content_hash: String,
     chunks: Vec<CodeChunk>,
+    references: Vec<Reference>,
     parse_failed: bool,
 }
 
@@ -165,15 +171,15 @@ async fn main() {
 
                     for file in discovery.files {
                         match parse_file(&file) {
-                            Ok(chunks) => {
-                                total_chunks += chunks.len();
-                                if !chunks.is_empty() {
+                            Ok(parsed) => {
+                                total_chunks += parsed.chunks.len();
+                                if !parsed.chunks.is_empty() {
                                     println!(
                                         "\n{} {}",
                                         "File:".magenta().bold(),
                                         file.display().to_string().underline()
                                     );
-                                    for chunk in chunks {
+                                    for chunk in parsed.chunks {
                                         println!(
                                             "  [{}] name: '{}' (lines {}-{})",
                                             chunk.chunk_type.yellow(),
@@ -212,6 +218,24 @@ async fn main() {
         }
         Some(Commands::Search { query, limit, directory }) => {
             run_search(&query, limit, &directory).await;
+        }
+        Some(Commands::Def { symbol, directory }) => {
+            if let Err(err) = show_definitions(&symbol, &directory) {
+                print_error(&format!("{:#}", err));
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Refs { symbol, directory }) => {
+            if let Err(err) = show_references(&symbol, &directory, false) {
+                print_error(&format!("{:#}", err));
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Callers { symbol, directory }) => {
+            if let Err(err) = show_references(&symbol, &directory, true) {
+                print_error(&format!("{:#}", err));
+                std::process::exit(1);
+            }
         }
         Some(Commands::List) => {
             if let Err(err) = list_indexes() {
@@ -396,6 +420,7 @@ async fn run_index(path: &Path, force: bool, options: &DiscoveryOptions) -> Resu
     }
     if rebuild_reason.is_none() && plan.files_to_index().next().is_none() {
         delete_untracked_chunks(&conn)?;
+        refresh_reference_graph(&mut conn, &plan)?;
         println!("{} Index is up to date\n", "✓".green().bold());
         print_index_statistics(&conn, &db_path);
         return Ok(());
@@ -422,6 +447,7 @@ async fn run_index(path: &Path, force: bool, options: &DiscoveryOptions) -> Resu
     println!("Generating embeddings...");
     let outcome = embed_and_store(&ollama, embedding_model, config.ollama.parallelism, &mut conn, parsed_files).await?;
     delete_untracked_chunks(&conn)?;
+    refresh_reference_graph(&mut conn, &plan)?;
     println!();
     print_skipped_chunks(&outcome.skipped_chunks);
 
@@ -500,6 +526,29 @@ fn read_source_files(
     (source_files, unreadable_files)
 }
 
+// Files indexed this run record their own calls and imports; this covers the ones that didn't change.
+fn refresh_reference_graph(conn: &mut rusqlite::Connection, plan: &IndexPlan) -> Result<(), anyhow::Error> {
+    if read_meta(conn, GRAPH_VERSION_KEY)?.as_deref() == Some(&CHUNK_FORMAT_VERSION.to_string()) {
+        return Ok(());
+    }
+
+    println!("Building the call graph...");
+    let all_files: Vec<&SourceFile> = plan.all_files().collect();
+    let by_file: Vec<(String, Vec<Reference>)> = all_files
+        .par_iter()
+        .map(|file| {
+            let references = parse_source(Path::new(&file.relative_path), &file.content)
+                .map(|parsed| parsed.references)
+                .unwrap_or_default();
+            (file.relative_path.clone(), references)
+        })
+        .collect();
+
+    replace_all_references(conn, &by_file)?;
+    write_meta(conn, GRAPH_VERSION_KEY, &CHUNK_FORMAT_VERSION.to_string())?;
+    Ok(())
+}
+
 fn print_index_plan(plan: &IndexPlan, rebuild_reason: Option<&str>) {
     if let Some(reason) = rebuild_reason {
         println!(
@@ -513,7 +562,7 @@ fn print_index_plan(plan: &IndexPlan, rebuild_reason: Option<&str>) {
         "Changes since the last index: {} new, {} changed, {} unchanged, {} removed",
         plan.new_files.len().to_string().yellow().bold(),
         plan.changed_files.len().to_string().yellow().bold(),
-        plan.unchanged_count,
+        plan.unchanged_count(),
         plan.removed_paths.len()
     );
 }
@@ -536,12 +585,18 @@ fn parse_planned_files(plan: &IndexPlan) -> Vec<ParsedFile> {
             if let Err(err) = &parsed {
                 parse_pb.suspend(|| print_warning_msg(&format!("Failed to parse {}: {}", file.relative_path, err)));
             }
+            let parse_failed_flag = parsed.is_err();
             parse_pb.inc(1);
+            let (chunks, references) = match parsed {
+                Ok(parsed) => (parsed.chunks, parsed.references),
+                Err(_) => (Vec::new(), Vec::new()),
+            };
             ParsedFile {
                 relative_path: file.relative_path.clone(),
                 content_hash: file.content_hash.clone(),
-                parse_failed: parsed.is_err(),
-                chunks: parsed.unwrap_or_default(),
+                parse_failed: parse_failed_flag,
+                chunks,
+                references,
             }
         })
         .collect();
@@ -577,6 +632,7 @@ async fn embed_and_store(
             content_hash: is_complete.then_some(file.content_hash.as_str()),
             chunks: &embedded.chunks,
             embeddings: &embedded.embeddings,
+            references: &file.references,
         })
         .context("Failed to save chunks to database")?;
 
@@ -788,6 +844,69 @@ fn locate_and_open_index(directory: &Path) -> Result<(IndexedProject, rusqlite::
     };
     let conn = open_index(&project.db_path)?;
     Ok((project, conn))
+}
+
+fn show_definitions(symbol: &str, directory: &Path) -> Result<(), anyhow::Error> {
+    let (_, conn) = locate_and_open_index(directory)?;
+    let definitions = find_definitions(&conn, symbol)?;
+    if definitions.is_empty() {
+        println!("{}", format!("Nothing named '{}' is defined in this project.", symbol).yellow());
+        return Ok(());
+    }
+
+    println!("{} {}:", count_of("definition", definitions.len()), format!("of '{}'", symbol).bold());
+    for definition in &definitions {
+        println!(
+            "  {} {}  {}",
+            format!("{}:{}", definition.file_path.display(), definition.start_line).cyan(),
+            format!("[{}]", definition.chunk_type).dimmed(),
+            first_line(&definition.content).dimmed()
+        );
+    }
+    Ok(())
+}
+
+fn show_references(symbol: &str, directory: &Path, only_calls: bool) -> Result<(), anyhow::Error> {
+    let (_, conn) = locate_and_open_index(directory)?;
+    let references = find_references(&conn, symbol, only_calls)?;
+    if references.is_empty() {
+        let what = match only_calls {
+            true => "calls",
+            false => "uses",
+        };
+        println!("{}", format!("Nothing {} '{}' in this project.", what, symbol).yellow());
+        print_graph_hint(&conn)?;
+        return Ok(());
+    }
+
+    println!("{} {}:", count_of("place", references.len()), format!("using '{}'", symbol).bold());
+    for reference in &references {
+        let file_path = reference.file_path.to_string_lossy().into_owned();
+        // A call is far more useful read as "which symbol makes it", not just which line.
+        let caller = match enclosing_symbol(&conn, &file_path, reference.line)? {
+            Some(caller) => format!(" in {}", caller.bold()),
+            None => String::new(),
+        };
+        println!(
+            "  {} {}{}",
+            format!("{}:{}", file_path, reference.line).cyan(),
+            format!("[{}]", reference.kind).dimmed(),
+            caller
+        );
+    }
+    Ok(())
+}
+
+// An index built before cbq recorded a graph has no references until it is indexed again.
+fn print_graph_hint(conn: &rusqlite::Connection) -> Result<(), anyhow::Error> {
+    if read_meta(conn, GRAPH_VERSION_KEY)?.is_none() {
+        println!("{}", "This index predates call tracking. Run `cbq index` to build it.".dimmed());
+    }
+    Ok(())
+}
+
+fn first_line(content: &str) -> String {
+    content.lines().map(str::trim).find(|line| !line.is_empty() && !line.starts_with("//")).unwrap_or("").to_string()
 }
 
 fn list_indexes() -> Result<(), anyhow::Error> {
@@ -1212,9 +1331,10 @@ fn print_search_results(results: &[SearchResult], confidence_threshold: f64) {
             false => String::new(),
         };
         // Ranking fuses similarity with keyword matching, so the scores shown aren't always descending.
-        let keywords = match result.matched_keywords {
-            true => "  (keyword match)".dimmed().to_string(),
-            false => String::new(),
+        let keywords = match (result.matched_keywords, result.found_via_calls) {
+            (_, true) => "  (called by the results above)".dimmed().to_string(),
+            (true, _) => "  (keyword match)".dimmed().to_string(),
+            _ => String::new(),
         };
         println!(
             "   {} {} {} {} [Score: {:.2}]{}{}",
@@ -1316,6 +1436,10 @@ async fn run_analyze(directory: &Path, requested_source: Option<DiffSource>) -> 
     }
     let ollama = prepare_ollama(&config, &models).await?;
 
+    let impacted = match &index {
+        Some((project, conn)) => find_impacted_callers(conn, &files, &project.root).await?,
+        None => Vec::new(),
+    };
     let related = match &index {
         Some((project, conn)) => {
             let vectors = load_chunk_vectors(conn)?;
@@ -1325,10 +1449,11 @@ async fn run_analyze(directory: &Path, requested_source: Option<DiffSource>) -> 
         None => Vec::new(),
     };
     if index.is_some() {
+        print_impacted_callers(&impacted);
         print_related_code(&related);
     }
 
-    let prompt = build_review_prompt(&files, &related);
+    let prompt = build_review_prompt(&files, &related, &impacted);
     if prompt.omitted_hunks > 0 {
         println!(
             "{}",
@@ -1379,6 +1504,76 @@ fn print_changed_files(files: &[FileDiff]) {
             format!("+{}", added).green(),
             format!("-{}", removed).red()
         );
+    }
+    println!();
+}
+
+// The changed symbols are looked up in the call graph, so "what else breaks" is answered from the
+// index rather than guessed by the model.
+async fn find_impacted_callers(
+    conn: &rusqlite::Connection,
+    files: &[FileDiff],
+    index_root: &Path,
+) -> Result<Vec<ImpactedSymbol>, anyhow::Error> {
+    let repository_root = find_repository_root(index_root).await;
+    let mut impacted: Vec<ImpactedSymbol> = Vec::new();
+
+    for file in files {
+        let Some(index_path) = to_index_path(&file.path, repository_root.as_deref(), index_root) else {
+            continue;
+        };
+        for hunk in &file.hunks {
+            let last_line = hunk.new_start + hunk.new_count.max(1) - 1;
+            for symbol in find_symbols_in_range(conn, &index_path, hunk.new_start, last_line)? {
+                if impacted.iter().any(|already| already.symbol == symbol) {
+                    continue;
+                }
+                let callers = callers_of(conn, &symbol, &index_path)?;
+                if !callers.is_empty() {
+                    impacted.push(ImpactedSymbol { symbol, callers });
+                }
+            }
+        }
+    }
+
+    impacted.truncate(MAX_IMPACTED_SYMBOLS);
+    Ok(impacted)
+}
+
+fn callers_of(
+    conn: &rusqlite::Connection,
+    symbol: &str,
+    changed_path: &str,
+) -> Result<Vec<CallSite>, anyhow::Error> {
+    let mut callers = Vec::new();
+    for reference in find_references(conn, symbol, true)? {
+        let file_path = reference.file_path.to_string_lossy().into_owned();
+        // A symbol calling itself, or the definition's own file, says nothing about what else breaks.
+        if file_path == changed_path {
+            continue;
+        }
+        callers.push(CallSite {
+            caller: enclosing_symbol(conn, &file_path, reference.line)?,
+            file_path,
+            line: reference.line,
+        });
+        if callers.len() == MAX_CALLERS_PER_SYMBOL {
+            break;
+        }
+    }
+    Ok(callers)
+}
+
+fn print_impacted_callers(impacted: &[ImpactedSymbol]) {
+    if impacted.is_empty() {
+        return;
+    }
+    println!("{}", "Callers of the changed code:".underline().bold());
+    for symbol in impacted {
+        println!("  {} is called from:", symbol.symbol.bold());
+        for caller in &symbol.callers {
+            println!("      - {}", caller.describe().cyan());
+        }
     }
     println!();
 }

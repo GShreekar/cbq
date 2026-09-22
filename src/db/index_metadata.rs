@@ -8,6 +8,8 @@ pub const DOCUMENT_PREFIX_KEY: &str = "document_prefix";
 pub const CHUNK_FORMAT_KEY: &str = "chunk_format";
 /// The directory the index was built from, so `cbq list` can name it.
 pub const PROJECT_ROOT_KEY: &str = "project_root";
+/// How the call and import graph was built; changing it rebuilds the graph without re-embedding.
+pub const GRAPH_VERSION_KEY: &str = "graph_version";
 /// Which build of the keyword index the chunks were fed into.
 pub const KEYWORD_INDEX_KEY: &str = "keyword_index";
 

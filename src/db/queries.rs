@@ -1,6 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
+use crate::services::symbols::{self, Reference};
 use crate::db::index_metadata::write_embedding_model;
 use crate::services::chunker::CodeChunk;
 
@@ -11,6 +12,7 @@ pub struct FileUpdate<'a> {
     pub content_hash: Option<&'a str>,
     pub chunks: &'a [CodeChunk],
     pub embeddings: &'a [Vec<f32>],
+    pub references: &'a [Reference],
 }
 
 /// Reads the content hash recorded for each indexed file; None marks a file whose indexing was incomplete.
@@ -59,6 +61,7 @@ pub fn replace_file_chunks(conn: &mut Connection, update: &FileUpdate) -> Result
         }
     }
 
+    replace_file_references(&tx, update.path, update.references)?;
     tx.execute(
         "INSERT INTO files (path, content_hash) VALUES (?1, ?2)
          ON CONFLICT(path) DO UPDATE SET content_hash = excluded.content_hash",
@@ -68,11 +71,144 @@ pub fn replace_file_chunks(conn: &mut Connection, update: &FileUpdate) -> Result
     Ok(())
 }
 
+/// Replaces the calls and imports recorded for one file.
+pub fn replace_file_references(conn: &Connection, path: &str, references: &[Reference]) -> Result<(), anyhow::Error> {
+    conn.execute("DELETE FROM refs WHERE file_path = ?1", [path])?;
+    let mut stmt = conn.prepare("INSERT INTO refs (symbol_name, file_path, line, kind) VALUES (?1, ?2, ?3, ?4)")?;
+    for reference in references {
+        stmt.execute(params![reference.symbol_name, path, reference.line as i64, reference.kind])?;
+    }
+    Ok(())
+}
+
+/// Rebuilds the whole call and import graph, for indexes built before cbq recorded one.
+pub fn replace_all_references(conn: &mut Connection, by_file: &[(String, Vec<Reference>)]) -> Result<(), anyhow::Error> {
+    let tx = conn.transaction()?;
+    tx.execute("DELETE FROM refs", [])?;
+    {
+        let mut stmt = tx.prepare("INSERT INTO refs (symbol_name, file_path, line, kind) VALUES (?1, ?2, ?3, ?4)")?;
+        for (path, references) in by_file {
+            for reference in references {
+                stmt.execute(params![reference.symbol_name, path, reference.line as i64, reference.kind])?;
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Finds where a symbol is defined. A qualified name such as `Cart::add` narrows it to that type.
+pub fn find_definitions(conn: &Connection, symbol: &str) -> Result<Vec<CodeChunk>, anyhow::Error> {
+    let (parent, name) = match symbol.rsplit_once("::") {
+        Some((parent, name)) => (Some(parent), name),
+        None => (None, symbol),
+    };
+    let mut stmt = conn.prepare(
+        "SELECT id, file_path, language, name, chunk_type, parent, content, start_line, end_line
+         FROM chunks
+         WHERE name = ?1 AND chunk_type NOT IN ('module', 'general') AND (?2 IS NULL OR parent = ?2)
+         ORDER BY file_path, start_line",
+    )?;
+    let rows = stmt.query_map(params![name, parent], |row| Ok(read_chunk(row)?.1))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Finds every place a symbol is used, optionally only the calls.
+pub fn find_references(conn: &Connection, symbol: &str, only_calls: bool) -> Result<Vec<Reference>, anyhow::Error> {
+    let name = symbol.rsplit("::").next().unwrap_or(symbol);
+    let mut stmt = conn.prepare(
+        "SELECT symbol_name, file_path, line, kind FROM refs
+         WHERE symbol_name = ?1 AND (?2 = 0 OR kind = 'call')
+         ORDER BY file_path, line",
+    )?;
+    let rows = stmt.query_map(params![name, only_calls as i64], |row| {
+        let kind: String = row.get(3)?;
+        Ok(Reference {
+            symbol_name: row.get(0)?,
+            file_path: PathBuf::from(row.get::<_, String>(1)?),
+            line: row.get(2)?,
+            // The column only ever holds the two kinds the parser records.
+            kind: if kind == symbols::CALL { symbols::CALL } else { symbols::IMPORT },
+        })
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Names the symbols called from within a range of lines, which is what that code depends on.
+pub fn called_symbols_in_range(
+    conn: &Connection,
+    file_path: &str,
+    start_line: usize,
+    end_line: usize,
+) -> Result<Vec<String>, anyhow::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT symbol_name FROM refs
+         WHERE file_path = ?1 AND line BETWEEN ?2 AND ?3 AND kind = 'call'",
+    )?;
+    let rows = stmt.query_map(params![file_path, start_line as i64, end_line as i64], |row| row.get(0))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Finds the ids of the chunks defining a symbol.
+pub fn find_definition_ids(conn: &Connection, symbol: &str) -> Result<Vec<i64>, anyhow::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT id FROM chunks WHERE name = ?1 AND chunk_type NOT IN ('module', 'general') ORDER BY id",
+    )?;
+    let rows = stmt.query_map([symbol], |row| row.get(0))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Names the symbols whose bodies overlap a range of lines, which is what a diff hunk touches.
+pub fn find_symbols_in_range(
+    conn: &Connection,
+    file_path: &str,
+    start_line: usize,
+    end_line: usize,
+) -> Result<Vec<String>, anyhow::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT name, parent FROM chunks
+         WHERE file_path = ?1 AND start_line <= ?3 AND end_line >= ?2
+           AND chunk_type NOT IN ('module', 'general')
+         ORDER BY start_line",
+    )?;
+    let rows = stmt.query_map(params![file_path, start_line as i64, end_line as i64], |row| {
+        let name: String = row.get(0)?;
+        let parent: Option<String> = row.get(1)?;
+        Ok(match parent {
+            Some(parent) => format!("{}::{}", parent, name),
+            None => name,
+        })
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Names the smallest symbol whose body contains a line, which is the symbol doing the calling.
+pub fn enclosing_symbol(conn: &Connection, file_path: &str, line: usize) -> Result<Option<String>, anyhow::Error> {
+    let name = conn
+        .query_row(
+            "SELECT name, parent FROM chunks
+             WHERE file_path = ?1 AND start_line <= ?2 AND end_line >= ?2 AND chunk_type NOT IN ('module', 'general')
+             ORDER BY (end_line - start_line) ASC LIMIT 1",
+            params![file_path, line as i64],
+            |row| {
+                let name: String = row.get(0)?;
+                let parent: Option<String> = row.get(1)?;
+                Ok(match parent {
+                    Some(parent) => format!("{}::{}", parent, name),
+                    None => name,
+                })
+            },
+        )
+        .optional()?;
+    Ok(name)
+}
+
 /// Deletes files that no longer exist in the project, along with their chunks.
 pub fn remove_files(conn: &mut Connection, paths: &[String]) -> Result<(), anyhow::Error> {
     let tx = conn.transaction()?;
     for path in paths {
         tx.execute("DELETE FROM chunks WHERE file_path = ?1", [path])?;
+        tx.execute("DELETE FROM refs WHERE file_path = ?1", [path])?;
         tx.execute("DELETE FROM files WHERE path = ?1", [path])?;
     }
     tx.commit()?;
@@ -83,6 +219,7 @@ pub fn remove_files(conn: &mut Connection, paths: &[String]) -> Result<(), anyho
 pub fn reset_index(conn: &mut Connection, embedding_model: &str) -> Result<(), anyhow::Error> {
     let tx = conn.transaction()?;
     tx.execute("DELETE FROM chunks", [])?;
+    tx.execute("DELETE FROM refs", [])?;
     tx.execute("DELETE FROM files", [])?;
     write_embedding_model(&tx, embedding_model)?;
     tx.commit()?;
@@ -91,6 +228,7 @@ pub fn reset_index(conn: &mut Connection, embedding_model: &str) -> Result<(), a
 
 /// Deletes chunks that belong to no tracked file, such as those left by indexes built before file tracking.
 pub fn delete_untracked_chunks(conn: &Connection) -> Result<usize, anyhow::Error> {
+    conn.execute("DELETE FROM refs WHERE file_path NOT IN (SELECT path FROM files)", [])?;
     Ok(conn.execute("DELETE FROM chunks WHERE file_path NOT IN (SELECT path FROM files)", [])?)
 }
 
@@ -106,24 +244,25 @@ pub fn chunks_by_ids(conn: &Connection, ids: &[i64]) -> Result<HashMap<i64, Code
         placeholders
     ))?;
 
-    let rows = stmt.query_map(rusqlite::params_from_iter(ids), |row| {
-        let id: i64 = row.get(0)?;
-        let file_path: String = row.get(1)?;
-        Ok((
-            id,
-            CodeChunk {
-                file_path: PathBuf::from(file_path),
-                language: row.get(2)?,
-                name: row.get(3)?,
-                chunk_type: row.get(4)?,
-                parent: row.get(5)?,
-                content: row.get(6)?,
-                start_line: row.get(7)?,
-                end_line: row.get(8)?,
-            },
-        ))
-    })?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(ids), read_chunk)?;
     Ok(rows.collect::<Result<_, _>>()?)
+}
+
+fn read_chunk(row: &rusqlite::Row) -> rusqlite::Result<(i64, CodeChunk)> {
+    let file_path: String = row.get(1)?;
+    Ok((
+        row.get(0)?,
+        CodeChunk {
+            file_path: PathBuf::from(file_path),
+            language: row.get(2)?,
+            name: row.get(3)?,
+            chunk_type: row.get(4)?,
+            parent: row.get(5)?,
+            content: row.get(6)?,
+            start_line: row.get(7)?,
+            end_line: row.get(8)?,
+        },
+    ))
 }
 
 /// Returns the ids of chunks matching the keywords, best first, ranked by BM25.
@@ -192,6 +331,7 @@ mod tests {
                 content_hash: Some(hash),
                 chunks: &[chunk_in(path)],
                 embeddings: &[vec![0.5; 4]],
+                references: &[],
             }).unwrap();
         }
         conn
@@ -205,6 +345,7 @@ mod tests {
             content_hash: Some("ccc"),
             chunks: &[chunk_in("src/a.rs"), chunk_in("src/a.rs")],
             embeddings: &[vec![0.5; 4], vec![0.5; 4]],
+            references: &[],
         }).unwrap();
 
         let stats = get_db_stats(&conn).unwrap();
@@ -220,6 +361,7 @@ mod tests {
             content_hash: None,
             chunks: &[chunk_in("src/b.rs")],
             embeddings: &[vec![0.5; 4]],
+            references: &[],
         }).unwrap();
         assert_eq!(read_file_hashes(&conn).unwrap()["src/b.rs"], None);
     }

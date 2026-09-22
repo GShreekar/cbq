@@ -10,6 +10,7 @@ No code is ever uploaded to the cloud—everything runs entirely on your local m
 
 - **Privacy First**: Everything runs against Ollama on your own machine. No API keys, no telemetry, no uploads. Pointing `ollama.host` at another machine is refused unless you allow it explicitly, and warns on every run once you do.
 - **Keeps Credentials Out**: Files that look like credentials, and source files containing private keys or access tokens, are left out of the index and listed so you know.
+- **Call Graph**: While indexing, cbq records every call and import, so it can answer where a symbol is defined, what uses it, and what calls it — instantly, without the model. A review of your changes uses the same graph to name the call sites a change may break.
 - **Hybrid Code Search**: Finds code by meaning (embeddings) and by exact wording (SQLite FTS5/BM25), merging both rankings so a plain-English question and a bare identifier both work.
 - **Code Chat (REPL)**: Talk directly to your codebase in an interactive chat session, maintaining context.
 - **Git Diff Impact Analysis**: Pipe `git diff` to `cbq` to receive a detailed analysis of your changes, including potential bugs, dependencies, and affected components.
@@ -172,10 +173,31 @@ Once the codebase is indexed, you can run queries.
 
 ---
 
-### 3. Git Integration & Impact Analysis
+### 3. Following Symbols
+
+These read the call graph directly. They involve no model and no embeddings, so they answer immediately.
+
+```bash
+cbq def compute_total        # where it is defined
+cbq refs compute_total       # every use, calls and imports
+cbq callers compute_total    # only the calls, and which symbol makes each one
+```
+
+A name can be qualified when several types share a method name:
+
+```bash
+cbq def Cart::add
+```
+
+Resolution is by name: cbq does not infer types, so two methods called `add` on different types both
+answer to `cbq callers add` unless you qualify the name.
+
+---
+
+### 4. Git Integration & Impact Analysis
 
 - **Review Changes**:
-  `cbq analyze` has the local chat model review a diff for likely bugs and for code elsewhere in the project that depends on what changed. Related code is found by searching the index with each changed hunk; without an index, the diff is still reviewed on its own.
+  `cbq analyze` has the local chat model review a diff for likely bugs, and lists the call sites of every changed symbol straight from the call graph, so "what else does this break" is looked up rather than guessed. Related code is found by searching the index with each changed hunk; without an index, the diff is still reviewed on its own.
   ```bash
   cbq analyze                 # all uncommitted changes (git diff HEAD)
   cbq analyze --staged        # only what's staged
@@ -185,7 +207,7 @@ Once the codebase is indexed, you can run queries.
 
 ---
 
-### 4. History and Transcripts
+### 5. History and Transcripts
 
 History is per project and lives in that project's index, so it stays with the codebase it belongs to.
 
@@ -204,7 +226,7 @@ History is per project and lives in that project's index, so it stays with the c
 
 ---
 
-### 5. Configuration Settings
+### 6. Configuration Settings
 
 Manage your configurations globally. Configurations are stored inside `~/.cbq/config.toml`.
 

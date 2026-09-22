@@ -66,6 +66,45 @@ pub enum Commands {
         )]
         directory: PathBuf,
     },
+    #[command(about = "Show where a symbol is defined")]
+    Def {
+        #[arg(help = "The symbol to look up, optionally qualified as Type::name")]
+        symbol: String,
+
+        #[arg(
+            short = 'C',
+            long,
+            help = "Project directory to use instead of the current one",
+            default_value = "."
+        )]
+        directory: PathBuf,
+    },
+    #[command(about = "Show everywhere a symbol is used")]
+    Refs {
+        #[arg(help = "The symbol to look up")]
+        symbol: String,
+
+        #[arg(
+            short = 'C',
+            long,
+            help = "Project directory to use instead of the current one",
+            default_value = "."
+        )]
+        directory: PathBuf,
+    },
+    #[command(about = "Show which symbols call a symbol")]
+    Callers {
+        #[arg(help = "The symbol to look up")]
+        symbol: String,
+
+        #[arg(
+            short = 'C',
+            long,
+            help = "Project directory to use instead of the current one",
+            default_value = "."
+        )]
+        directory: PathBuf,
+    },
     #[command(about = "List the projects cbq has indexed")]
     List,
     #[command(about = "Delete this project's index, or every index")]
