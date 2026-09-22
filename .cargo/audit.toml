@@ -1,0 +1,17 @@
+# Read by cargo-audit, including the audit-check step in CI. Everything ignored here is a
+# vulnerability cbq still ships; each one needs a reason and a way out, not just silence.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2026-0258: h2 accepts unbounded empty DATA frames. Reached through
+    # reqwest 0.11 -> hyper 0.14 -> h2 0.3, and the 0.3 line has no patched release: the fix
+    # lands in h2 0.4.16, which needs reqwest 0.12+ and hyper 1.x.
+    #
+    # A default build never exercises it. cbq talks plain HTTP to Ollama on localhost and never
+    # asks for HTTP/2, so h2 is compiled but never negotiated. Built with `--features https` and
+    # pointed at an https:// Ollama, ALPN can negotiate HTTP/2 and this code becomes reachable,
+    # with the Ollama server you chose as the only peer.
+    #
+    # Remove this when reqwest moves to 0.13, which also drops the unmaintained rustls-pemfile.
+    "RUSTSEC-2026-0258",
+]

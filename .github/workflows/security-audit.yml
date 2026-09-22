@@ -8,6 +8,11 @@ on:
     # Advisories are published against dependencies that have not changed, so this also runs weekly.
     - cron: "0 7 * * 1"
 
+# audit-check reports through a check run, which the default read-only token cannot create.
+permissions:
+  contents: read
+  checks: write
+
 jobs:
   audit:
     runs-on: ubuntu-latest

@@ -10,6 +10,8 @@ repository = "https://github.com/GShreekar/cbq"
 readme = "README.md"
 keywords = ["code-search", "semantic-search", "ollama", "rag", "cli"]
 categories = ["command-line-utilities", "development-tools"]
+# Repository plumbing; the crate people download needs none of it.
+exclude = [".github/", ".cargo/", "deny.toml"]
 
 [dependencies]
 clap = { version = "4.4", features = ["derive"] }
