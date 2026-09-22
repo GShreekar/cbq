@@ -10,6 +10,7 @@ No code is ever uploaded to the cloud—everything runs entirely on your local m
 
 - **Privacy First**: Everything runs against Ollama on your own machine. No API keys, no telemetry, no uploads. Pointing `ollama.host` at another machine is refused unless you allow it explicitly, and warns on every run once you do.
 - **Keeps Credentials Out**: Files that look like credentials, and source files containing private keys or access tokens, are left out of the index and listed so you know.
+- **Machine-Readable**: `--json` on any command returns structured results with exit codes, so editors, scripts and agents can use cbq directly.
 - **Call Graph**: While indexing, cbq records every call and import, so it can answer where a symbol is defined, what uses it, and what calls it — instantly, without the model. A review of your changes uses the same graph to name the call sites a change may break.
 - **Hybrid Code Search**: Finds code by meaning (embeddings) and by exact wording (SQLite FTS5/BM25), merging both rankings so a plain-English question and a bare identifier both work.
 - **Code Chat (REPL)**: Talk directly to your codebase in an interactive chat session, maintaining context.
@@ -18,6 +19,23 @@ No code is ever uploaded to the cloud—everything runs entirely on your local m
 - **Context-Enriched Embeddings**: What gets embedded is the code behind a header naming its file, language, symbol and enclosing type, so a method called `add` is not just the word `add` in a vacuum.
 - **Model Auto-Provisioning**: Checks whether the configured models are on your Ollama server and pulls any that are missing, over Ollama's HTTP API, so Ollama running in Docker or on another machine works too.
 - **History & Export**: Every question, its answer and the code it cited are recorded in that project's own index; review them with `cbq history` or export a Markdown transcript.
+
+---
+
+## Output for scripts and editors
+
+Add `--json` to any command to get structured output on stdout instead of prose. Failures print
+`{"error": ...}` on stderr and exit non-zero, so a caller can tell success from failure without parsing text.
+
+```bash
+cbq search "how is tax applied?" --json | jq '.results[0].path'
+cbq def compute_total --json
+cbq status --json | jq '.stale'
+cbq doctor --json          # exits 1 if anything is broken
+```
+
+`cbq chat --json` prints one object per answer as the conversation goes, and `cbq index --json` prints a
+summary of what it did. Progress bars and spinners are suppressed, so stdout holds nothing but results.
 
 ---
 
@@ -153,6 +171,12 @@ To get started, you must index your codebase.
 
   Re-running `cbq index` only embeds files whose content changed since the last run, and drops files that were deleted; an unchanged project is up to date in well under a second, without contacting Ollama. Each file is saved as soon as it is embedded, so an interrupted run picks up where it stopped. Chunks that fail to embed are skipped, listed, and retried on the next run. Use `--force` to rebuild everything; changing `ollama.embedding_model` triggers a rebuild automatically.
 
+  `--include` and `--exclude` narrow a run to certain globs, repeatable and usable on `cbq init` too:
+
+  ```bash
+  cbq index --include 'src/**' --exclude '**/generated.rs'
+  ```
+
   Indexing honors `.gitignore` (even outside a git repository), `.ignore`, and `.cbqignore` files, which use the same syntax for paths you want kept out of the index. It always skips version-control, dependency and build directories (`.git`, `node_modules`, `vendor`, `target`, `dist`, `build`, virtualenvs and similar), lockfiles, and minified `*.min.*` files. Files over 512 KB are skipped and listed; raise the limit with `cbq index --max-file-size <KB>`.
 
 ---
@@ -190,7 +214,17 @@ Once the codebase is indexed, you can run queries.
   ```bash
   cbq chat
   ```
+  The prompt supports editing and history: arrow keys move through the line and recall earlier questions,
+  Ctrl-A/E jump to the ends, Ctrl-W deletes a word, Ctrl-C abandons the line and Ctrl-D ends the session.
+
   The session remembers the conversation, so follow-ups like "what calls it?" refer back to earlier answers. Type `/clear` to start a new conversation, and `exit`, `quit` or `Ctrl-D` to leave.
+
+- **Keeping the index current**:
+  `cbq watch` indexes once, then re-indexes whenever a source file changes. Edits are collected for a
+  moment before it reacts, and writes to build directories are ignored, so a compile doesn't trigger it.
+  ```bash
+  cbq watch [path/to/project]
+  ```
 
 ---
 
@@ -284,11 +318,16 @@ allow_remote = false
 [search]
 top_k = 5
 similarity_threshold = 0.5
+rerank = false
 ```
 
 `ollama.parallelism` is how many embedding requests cbq keeps in flight while indexing. One suits a
 server that works through requests serially, which is the default; raise it only if you have set
 `OLLAMA_NUM_PARALLEL` above 1 and have the GPU memory for it.
+
+Setting `search.rerank = true` has the chat model re-order candidates before answering. On this
+project's own eval it moved MRR from 0.950 to 1.000, but roughly tripled the time per question, so it
+is off by default.
 
 `similarity_threshold` marks weak matches in search results rather than hiding them; in `cbq analyze` it does filter, so unrelated code is kept out of the review.
 

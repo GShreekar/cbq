@@ -27,6 +27,7 @@ impl Default for SearchConfig {
         SearchConfig {
             top_k: 5,
             similarity_threshold: 0.5,
+            rerank: false,
         }
     }
 }

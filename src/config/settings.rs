@@ -36,6 +36,9 @@ pub struct OllamaConfig {
 pub struct SearchConfig {
     pub top_k: usize,
     pub similarity_threshold: f64,
+    /// Have the chat model re-order candidates before answering; costs one extra model call per question.
+    #[serde(default)]
+    pub rerank: bool,
 }
 
 /// Returns the directory holding every index, config file and export cbq writes.

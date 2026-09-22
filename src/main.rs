@@ -4,6 +4,7 @@ pub mod db;
 pub mod config;
 pub mod ui;
 pub mod doctor;
+pub mod output;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -13,12 +14,13 @@ use clap::Parser;
 use cli::args::{Cli, Commands};
 use services::chunker::{CodeChunk, CHUNK_FORMAT_VERSION};
 use services::embeddings::{document_prefix, embed_documents, embed_query};
-use services::file_discovery::{discover_files, DiscoveryOptions, SkipReason, SkippedFile};
+use services::file_discovery::{discover_files, looks_indexable, DiscoveryOptions, SkipReason, SkippedFile};
 use services::index_plan::{plan_index, read_source_files, IndexPlan, SourceFile};
 use services::parser::{parse_file, parse_source};
 use services::symbols::Reference;
 use services::vector_search::{is_test_file, load_chunk_vectors, ChunkVectors, SearchResult};
 use services::search::find_relevant_chunks;
+use services::rerank::{apply_ranking, build_rerank_prompt, parse_ranking};
 use services::chat_history::{
     citations_from, count_turns, default_export_path, new_session_id, now_timestamp, read_turns, record_turn,
     render_transcript, RecordedTurn,
@@ -46,6 +48,9 @@ use db::queries::{
 };
 use ui::formatter::{print_error, print_warning_msg};
 use ui::stream::StreamingMarkdown;
+use ui::line_editor::{Input, LineEditor};
+use output::{emit, emit_error, round_score, search_result_json, OutputFormat};
+use serde_json::json;
 use rayon::prelude::*;
 use indicatif::{ProgressBar, ProgressStyle};
 use colored::Colorize;
@@ -116,150 +121,80 @@ struct ChunkEmbedder<'a> {
 #[tokio::main]
 async fn main() {
     let args = Cli::parse();
+    let format = match args.json {
+        true => OutputFormat::Json,
+        false => OutputFormat::Text,
+    };
 
     match args.command {
-        Some(Commands::Init { path }) => {
-            println!("{}", "Scanning repository...".cyan());
-
-            let spinner = ProgressBar::new_spinner();
-            spinner.enable_steady_tick(Duration::from_millis(100));
-            spinner.set_message("Discovering files...");
-
-            match discover_files(&path, &DiscoveryOptions::default()) {
-                Ok(result) => {
-                    spinner.finish_and_clear();
-
-                    println!(
-                        "{} {} {}",
-                        "Found".green().bold(),
-                        result.files.len().to_string().yellow().bold(),
-                        "indexable files:".green().bold()
-                    );
-
-                    let mut counts: Vec<(&String, &usize)> = result.extension_counts.iter().collect();
-                    counts.sort_by(|a, b| b.1.cmp(a.1));
-
-                    for (ext, count) in counts {
-                        println!(
-                            "  - {} (.{ext}): {} files",
-                            ext.to_uppercase().blue(),
-                            count.to_string().bold()
-                        );
-                    }
-
-                    println!();
-                    print_skipped_files(&result.skipped, &path);
-                    println!("{}", "✓ Ready to index. Run: cbq index <path>".green());
-                }
-                Err(err) => {
-                    spinner.finish_and_clear();
-                    print_error(&format!("Could not scan files: {}", err));
-                    std::process::exit(1);
-                }
+        Some(Commands::Init { path, scan }) => {
+            if let Err(err) = run_init(&path, &scan_options(scan), format) {
+                report_failure(&format!("{:#}", err), format);
+                std::process::exit(1);
             }
         }
         Some(Commands::Parse { path }) => {
-            println!("{}", "Scanning and parsing repository...".cyan());
-            
-            let spinner = ProgressBar::new_spinner();
-            spinner.enable_steady_tick(Duration::from_millis(100));
-            spinner.set_message("Parsing files...");
-
-            match discover_files(&path, &DiscoveryOptions::default()) {
-                Ok(discovery) => {
-                    let mut total_chunks = 0;
-
-                    for file in discovery.files {
-                        match parse_file(&file) {
-                            Ok(parsed) => {
-                                total_chunks += parsed.chunks.len();
-                                if !parsed.chunks.is_empty() {
-                                    println!(
-                                        "\n{} {}",
-                                        "File:".magenta().bold(),
-                                        file.display().to_string().underline()
-                                    );
-                                    for chunk in parsed.chunks {
-                                        println!(
-                                            "  [{}] name: '{}' (lines {}-{})",
-                                            chunk.chunk_type.yellow(),
-                                            chunk.name.blue().bold(),
-                                            chunk.start_line,
-                                            chunk.end_line
-                                        );
-                                    }
-                                }
-                            }
-                            Err(err) => {
-                                print_error(&format!("Failed to parse {}: {}", file.display(), err));
-                            }
-                        }
-                    }
-                    spinner.finish_and_clear();
-                    println!(
-                        "\n{} Total logical chunks found: {}",
-                        "✓ Parsing completed.".green().bold(),
-                        total_chunks.to_string().bold().yellow()
-                    );
-                }
-                Err(err) => {
-                    spinner.finish_and_clear();
-                    print_error(&format!("{}", err));
-                    std::process::exit(1);
-                }
+            if let Err(err) = run_parse(&path, format) {
+                report_failure(&format!("{:#}", err), format);
+                std::process::exit(1);
             }
         }
-        Some(Commands::Index { path, force, max_file_size_kb, allow_secrets }) => {
-            let options = DiscoveryOptions { max_file_bytes: max_file_size_kb * 1024, allow_secrets };
-            if let Err(err) = run_index(&path, force, &options).await {
-                print_error(&format!("{:#}", err));
+        Some(Commands::Index { path, force, scan }) => {
+            if let Err(err) = run_index(&path, force, &scan_options(scan), format).await {
+                report_failure(&format!("{:#}", err), format);
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Watch { path, scan }) => {
+            if let Err(err) = run_watch(&path, &scan_options(scan), format).await {
+                report_failure(&format!("{:#}", err), format);
                 std::process::exit(1);
             }
         }
         Some(Commands::Search { query, limit, directory }) => {
-            run_search(&query, limit, &directory).await;
+            run_search(&query, limit, &directory, format).await;
         }
         Some(Commands::Def { symbol, directory }) => {
-            if let Err(err) = show_definitions(&symbol, &directory) {
-                print_error(&format!("{:#}", err));
+            if let Err(err) = show_definitions(&symbol, &directory, format) {
+                report_failure(&format!("{:#}", err), format);
                 std::process::exit(1);
             }
         }
         Some(Commands::Refs { symbol, directory }) => {
-            if let Err(err) = show_references(&symbol, &directory, false) {
-                print_error(&format!("{:#}", err));
+            if let Err(err) = show_references(&symbol, &directory, false, format) {
+                report_failure(&format!("{:#}", err), format);
                 std::process::exit(1);
             }
         }
         Some(Commands::Callers { symbol, directory }) => {
-            if let Err(err) = show_references(&symbol, &directory, true) {
-                print_error(&format!("{:#}", err));
+            if let Err(err) = show_references(&symbol, &directory, true, format) {
+                report_failure(&format!("{:#}", err), format);
                 std::process::exit(1);
             }
         }
         Some(Commands::Doctor { directory }) => {
             let checks = doctor::run_checks(&directory).await;
-            print_checks(&checks);
+            print_checks(&checks, format);
             // A non-zero exit lets a script tell "cbq is ready" from "cbq needs attention".
             if checks.iter().any(|check| check.status == doctor::Status::Failed) {
                 std::process::exit(1);
             }
         }
         Some(Commands::Status { directory }) => {
-            if let Err(err) = print_status(&directory) {
-                print_error(&format!("{:#}", err));
+            if let Err(err) = print_status(&directory, format) {
+                report_failure(&format!("{:#}", err), format);
                 std::process::exit(1);
             }
         }
         Some(Commands::List) => {
-            if let Err(err) = list_indexes() {
-                print_error(&format!("{:#}", err));
+            if let Err(err) = list_indexes(format) {
+                report_failure(&format!("{:#}", err), format);
                 std::process::exit(1);
             }
         }
         Some(Commands::Clean { all, yes, directory }) => {
-            if let Err(err) = clean_indexes(&directory, all, yes) {
-                print_error(&format!("{:#}", err));
+            if let Err(err) = clean_indexes(&directory, all, yes, format) {
+                report_failure(&format!("{:#}", err), format);
                 std::process::exit(1);
             }
         }
@@ -329,6 +264,15 @@ async fn main() {
                             }
                             conf.ollama.embedding_model = value;
                         }
+                        "search.rerank" | "rerank" => {
+                            match value.parse::<bool>() {
+                                Ok(rerank) => conf.search.rerank = rerank,
+                                Err(_) => {
+                                    print_error("rerank must be true or false");
+                                    std::process::exit(1);
+                                }
+                            }
+                        }
                         "search.top_k" | "top_k" => {
                             if let Ok(v) = value.parse::<usize>() {
                                 conf.search.top_k = v;
@@ -360,20 +304,20 @@ async fn main() {
             }
         }
         Some(Commands::History { limit, directory }) => {
-            if let Err(err) = show_history(&directory, limit) {
-                print_error(&format!("{:#}", err));
+            if let Err(err) = show_history(&directory, limit, format) {
+                report_failure(&format!("{:#}", err), format);
                 std::process::exit(1);
             }
         }
         Some(Commands::Export { output, directory }) => {
-            if let Err(err) = export_history(&directory, output.as_deref()) {
-                print_error(&format!("{:#}", err));
+            if let Err(err) = export_history(&directory, output.as_deref(), format) {
+                report_failure(&format!("{:#}", err), format);
                 std::process::exit(1);
             }
         }
         Some(Commands::Chat { directory }) => {
-            if let Err(err) = run_chat_repl(&directory).await {
-                print_error(&format!("Chat session error: {:#}", err));
+            if let Err(err) = run_chat_repl(&directory, format).await {
+                report_failure(&format!("Chat session error: {:#}", err), format);
                 std::process::exit(1);
             }
         }
@@ -383,14 +327,14 @@ async fn main() {
                 (false, Some(base)) => Some(DiffSource::SinceBase(base)),
                 (false, None) => None,
             };
-            if let Err(err) = run_analyze(&directory, requested_source).await {
-                print_error(&format!("Analysis failed: {:#}", err));
+            if let Err(err) = run_analyze(&directory, requested_source, format).await {
+                report_failure(&format!("Analysis failed: {:#}", err), format);
                 std::process::exit(1);
             }
         }
         None => {
             if let Some(query) = args.default_query {
-                run_search(&query, None, Path::new(".")).await;
+                run_search(&query, None, Path::new("."), format).await;
             } else {
                 println!("No arguments provided. Run with --help to see usage.");
             }
@@ -398,9 +342,19 @@ async fn main() {
     }
 }
 
-async fn run_index(path: &Path, force: bool, options: &DiscoveryOptions) -> Result<(), anyhow::Error> {
+async fn run_index(
+    path: &Path,
+    force: bool,
+    options: &DiscoveryOptions,
+    format: OutputFormat,
+) -> Result<(), anyhow::Error> {
     let project_root = canonical_project_root(path)?;
-    println!("Indexing {}...", project_root.display().to_string().cyan());
+    let say = |line: String| {
+        if format.is_text() {
+            println!("{}", line);
+        }
+    };
+    say(format!("Indexing {}...", project_root.display().to_string().cyan()));
 
     let config = match load_config() {
         Ok(c) => c,
@@ -420,31 +374,39 @@ async fn run_index(path: &Path, force: bool, options: &DiscoveryOptions) -> Resu
     let discovery = discover_files(&project_root, options).context("File discovery failed")?;
     let (source_files, unreadable_files) = read_source_files(&discovery.files, &project_root, options.allow_secrets);
     let skipped_files: Vec<SkippedFile> = discovery.skipped.into_iter().chain(unreadable_files).collect();
-    print_skipped_files(&skipped_files, &project_root);
+    if format.is_text() {
+        print_skipped_files(&skipped_files, &project_root);
+    }
 
     let recorded_hashes = match rebuild_reason {
         Some(_) => HashMap::new(),
         None => read_file_hashes(&conn)?,
     };
     let plan = plan_index(source_files, &recorded_hashes);
-    print_index_plan(&plan, rebuild_reason.as_deref());
+    if format.is_text() {
+        print_index_plan(&plan, rebuild_reason.as_deref());
+    }
 
     if rebuild_reason.is_none() {
         remove_files(&mut conn, &plan.removed_paths)?;
     }
     if rebuild_reason.is_none() && plan.files_to_index().next().is_none() {
         delete_untracked_chunks(&conn)?;
-        refresh_reference_graph(&mut conn, &plan)?;
+        refresh_reference_graph(&mut conn, &plan, format)?;
+        if format.is_json() {
+            emit(index_summary_json(&project_root, &plan, &IndexOutcome::default(), true));
+            return Ok(());
+        }
         println!("{} Index is up to date\n", "✓".green().bold());
         print_index_statistics(&conn, &db_path);
         return Ok(());
     }
 
-    println!("Checking Ollama connection...");
+    say("Checking Ollama connection...".to_string());
     let embedding_model = &config.ollama.embedding_model;
     let ollama = prepare_ollama(&config, &[embedding_model]).await?;
-    println!("{} Connected to {}", "✓".green().bold(), ollama.address());
-    println!("Embedding model: {}\n", embedding_model.yellow().bold());
+    say(format!("{} Connected to {}", "✓".green().bold(), ollama.address()));
+    say(format!("Embedding model: {}\n", embedding_model.yellow().bold()));
 
     // The old index is only cleared once Ollama is known to be ready to rebuild it.
     match rebuild_reason {
@@ -454,17 +416,22 @@ async fn run_index(path: &Path, force: bool, options: &DiscoveryOptions) -> Resu
     write_meta(&conn, CHUNK_FORMAT_KEY, &CHUNK_FORMAT_VERSION.to_string())?;
     write_meta(&conn, DOCUMENT_PREFIX_KEY, document_prefix(embedding_model))?;
 
-    println!("Parsing files...");
-    let parsed_files = parse_planned_files(&plan);
-    println!();
+    say("Parsing files...".to_string());
+    let parsed_files = parse_planned_files(&plan, format);
+    say(String::new());
 
-    println!("Generating embeddings...");
-    let outcome = embed_and_store(&ollama, embedding_model, config.ollama.parallelism, &mut conn, parsed_files).await?;
+    say("Generating embeddings...".to_string());
+    let outcome =
+        embed_and_store(&ollama, embedding_model, config.ollama.parallelism, &mut conn, parsed_files, format).await?;
     delete_untracked_chunks(&conn)?;
-    refresh_reference_graph(&mut conn, &plan)?;
+    refresh_reference_graph(&mut conn, &plan, format)?;
+    if format.is_json() {
+        emit(index_summary_json(&project_root, &plan, &outcome, false));
+        return Ok(());
+    }
+
     println!();
     print_skipped_chunks(&outcome.skipped_chunks);
-
     println!(
         "{} {} chunks stored from {} files\n",
         "✓".green().bold(),
@@ -506,12 +473,17 @@ fn stored_format_reason(conn: &rusqlite::Connection, model: &str) -> Result<Opti
 }
 
 // Files indexed this run record their own calls and imports; this covers the ones that didn't change.
-fn refresh_reference_graph(conn: &mut rusqlite::Connection, plan: &IndexPlan) -> Result<(), anyhow::Error> {
+fn refresh_reference_graph(
+    conn: &mut rusqlite::Connection,
+    plan: &IndexPlan,
+    format: OutputFormat,
+) -> Result<(), anyhow::Error> {
     if read_meta(conn, GRAPH_VERSION_KEY)?.as_deref() == Some(&CHUNK_FORMAT_VERSION.to_string()) {
         return Ok(());
     }
-
-    println!("Building the call graph...");
+    if format.is_text() {
+        println!("Building the call graph...");
+    }
     let all_files: Vec<&SourceFile> = plan.all_files().collect();
     let by_file: Vec<(String, Vec<Reference>)> = all_files
         .par_iter()
@@ -546,9 +518,9 @@ fn print_index_plan(plan: &IndexPlan, rebuild_reason: Option<&str>) {
     );
 }
 
-fn parse_planned_files(plan: &IndexPlan) -> Vec<ParsedFile> {
+fn parse_planned_files(plan: &IndexPlan, format: OutputFormat) -> Vec<ParsedFile> {
     let files: Vec<&SourceFile> = plan.files_to_index().collect();
-    let parse_pb = ProgressBar::new(files.len() as u64);
+    let parse_pb = progress_bar(files.len() as u64, format);
     parse_pb.set_style(
         ProgressStyle::with_template("[{bar:16.green}] {percent}% - {msg}")
             .unwrap()
@@ -592,9 +564,10 @@ async fn embed_and_store(
     parallelism: usize,
     conn: &mut rusqlite::Connection,
     files: Vec<ParsedFile>,
+    format: OutputFormat,
 ) -> Result<IndexOutcome, anyhow::Error> {
     let total_chunks: usize = files.iter().map(|file| file.chunks.len()).sum();
-    let progress = ProgressBar::new(total_chunks as u64);
+    let progress = progress_bar(total_chunks as u64, format);
     progress.set_style(
         ProgressStyle::with_template("[{bar:16.green}] {percent}% - {pos}/{len} embeddings generated")
             .unwrap()
@@ -825,9 +798,23 @@ fn locate_and_open_index(directory: &Path) -> Result<(IndexedProject, rusqlite::
     Ok((project, conn))
 }
 
-fn show_definitions(symbol: &str, directory: &Path) -> Result<(), anyhow::Error> {
+fn show_definitions(symbol: &str, directory: &Path, format: OutputFormat) -> Result<(), anyhow::Error> {
     let (_, conn) = locate_and_open_index(directory)?;
     let definitions = find_definitions(&conn, symbol)?;
+    if format.is_json() {
+        emit(json!({
+            "symbol": symbol,
+            "definitions": definitions.iter().map(|definition| json!({
+                "path": definition.file_path.to_string_lossy(),
+                "start_line": definition.start_line,
+                "end_line": definition.end_line,
+                "kind": definition.chunk_type,
+                "parent": definition.parent,
+                "signature": first_line(&definition.content),
+            })).collect::<Vec<_>>(),
+        }));
+        return Ok(());
+    }
     if definitions.is_empty() {
         println!("{}", format!("Nothing named '{}' is defined in this project.", symbol).yellow());
         return Ok(());
@@ -845,9 +832,28 @@ fn show_definitions(symbol: &str, directory: &Path) -> Result<(), anyhow::Error>
     Ok(())
 }
 
-fn show_references(symbol: &str, directory: &Path, only_calls: bool) -> Result<(), anyhow::Error> {
+fn show_references(
+    symbol: &str,
+    directory: &Path,
+    only_calls: bool,
+    format: OutputFormat,
+) -> Result<(), anyhow::Error> {
     let (_, conn) = locate_and_open_index(directory)?;
     let references = find_references(&conn, symbol, only_calls)?;
+    if format.is_json() {
+        let mut described = Vec::new();
+        for reference in &references {
+            let file_path = reference.file_path.to_string_lossy().into_owned();
+            described.push(json!({
+                "path": file_path,
+                "line": reference.line,
+                "kind": reference.kind,
+                "caller": enclosing_symbol(&conn, &file_path, reference.line)?,
+            }));
+        }
+        emit(json!({ "symbol": symbol, "references": described }));
+        return Ok(());
+    }
     if references.is_empty() {
         let what = match only_calls {
             true => "calls",
@@ -888,7 +894,259 @@ fn first_line(content: &str) -> String {
     content.lines().map(str::trim).find(|line| !line.is_empty() && !line.starts_with("//")).unwrap_or("").to_string()
 }
 
-fn print_checks(checks: &[doctor::Check]) {
+fn report_failure(message: &str, format: OutputFormat) {
+    match format.is_json() {
+        true => emit_error(message),
+        false => print_error(message),
+    }
+}
+
+// Editors write a file several times in quick succession, so changes are collected before reacting.
+const WATCH_QUIET_PERIOD: Duration = Duration::from_millis(800);
+
+/// Indexes the project, then re-indexes whenever its source files change.
+async fn run_watch(path: &Path, options: &DiscoveryOptions, format: OutputFormat) -> Result<(), anyhow::Error> {
+    let project_root = canonical_project_root(path)?;
+    run_index(&project_root, false, options, format).await?;
+
+    let (sender, receiver) = std::sync::mpsc::channel();
+    use notify::Watcher;
+    let mut watcher = notify::recommended_watcher(move |event| {
+        let _ = sender.send(event);
+    })?;
+    watcher.watch(&project_root, notify::RecursiveMode::Recursive)?;
+
+    if format.is_text() {
+        println!("\n{}", format!("Watching {} for changes. Press Ctrl-C to stop.", project_root.display()).cyan());
+    }
+
+    loop {
+        // Waits for something to happen, then for things to stop happening.
+        if !wait_for_change(&receiver)? {
+            return Ok(());
+        }
+        if format.is_text() {
+            println!("\n{}", "Changes detected, updating the index...".dimmed());
+        }
+        if let Err(err) = run_index(&project_root, false, options, format).await {
+            report_failure(&format!("{:#}", err), format);
+        }
+    }
+}
+
+// Indexing reads every file, and reading a file is itself an event. Reacting to those would make
+// each index run trigger the next one, so only events that change a file's contents count.
+fn changes_content(event: &notify::Event) -> bool {
+    use notify::event::{EventKind, ModifyKind};
+    matches!(
+        event.kind,
+        EventKind::Create(_)
+            | EventKind::Remove(_)
+            | EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Name(_) | ModifyKind::Any)
+    )
+}
+
+// Returns false once the watcher has gone away, which is how the loop ends.
+fn wait_for_change(receiver: &std::sync::mpsc::Receiver<notify::Result<notify::Event>>) -> Result<bool, anyhow::Error> {
+    loop {
+        match receiver.recv() {
+            Ok(Ok(event)) if changes_content(&event) && event.paths.iter().any(|path| looks_indexable(path)) => break,
+            Ok(_) => continue,
+            Err(_) => return Ok(false),
+        }
+    }
+
+    // Drain whatever else arrives until the project has been quiet for a moment.
+    while receiver.recv_timeout(WATCH_QUIET_PERIOD).is_ok() {}
+    Ok(true)
+}
+
+// Reranking only helps if it is given more to choose from than will be returned.
+const RERANK_CANDIDATE_MULTIPLIER: usize = 3;
+const MAX_RERANK_CANDIDATES: usize = 15;
+
+fn candidate_count(limit: usize, config: &Config) -> usize {
+    match config.search.rerank {
+        true => (limit * RERANK_CANDIDATE_MULTIPLIER).min(MAX_RERANK_CANDIDATES),
+        false => limit,
+    }
+}
+
+// A second opinion from the chat model on which candidates actually answer the question.
+async fn rerank_results(
+    ollama: &Ollama,
+    config: &Config,
+    query: &str,
+    results: Vec<SearchResult>,
+    limit: usize,
+) -> Vec<SearchResult> {
+    if !config.search.rerank || results.len() <= 1 {
+        return results.into_iter().take(limit).collect();
+    }
+
+    let prompt = build_rerank_prompt(query, &results);
+    match ollama.generate_deterministic(&config.ollama.chat_model, &prompt).await {
+        Ok(answer) => {
+            let ranking = parse_ranking(&answer, results.len());
+            apply_ranking(results, &ranking, limit)
+        }
+        // A reranker that fails should cost nothing but the wait; the fused order is still good.
+        Err(err) => {
+            print_warning_msg(&format!("Could not rerank results, using the search order: {}", err));
+            results.into_iter().take(limit).collect()
+        }
+    }
+}
+
+fn scan_options(scan: cli::args::ScanArgs) -> DiscoveryOptions {
+    DiscoveryOptions {
+        max_file_bytes: scan.max_file_size_kb * 1024,
+        allow_secrets: scan.allow_secrets,
+        include: scan.include,
+        exclude: scan.exclude,
+    }
+}
+
+fn run_init(path: &Path, options: &DiscoveryOptions, format: OutputFormat) -> Result<(), anyhow::Error> {
+    let spinner = start_spinner("Discovering files...", format);
+    let result = discover_files(path, options)?;
+    spinner.finish_and_clear();
+
+    if format.is_json() {
+        emit(json!({
+            "files": result.files.len(),
+            "by_extension": result.extension_counts,
+            "skipped": result.skipped.iter().map(|file| json!({
+                "path": file.path.to_string_lossy(),
+                "reason": file.reason.to_string(),
+            })).collect::<Vec<_>>(),
+        }));
+        return Ok(());
+    }
+
+    println!(
+        "{} {} {}",
+        "Found".green().bold(),
+        result.files.len().to_string().yellow().bold(),
+        "indexable files:".green().bold()
+    );
+    let mut counts: Vec<(&String, &usize)> = result.extension_counts.iter().collect();
+    counts.sort_by(|a, b| b.1.cmp(a.1));
+    for (extension, count) in counts {
+        println!("  - {} (.{extension}): {} files", extension.to_uppercase().blue(), count.to_string().bold());
+    }
+
+    println!();
+    print_skipped_files(&result.skipped, path);
+    println!("{}", "✓ Ready to index. Run: cbq index <path>".green());
+    Ok(())
+}
+
+fn run_parse(path: &Path, format: OutputFormat) -> Result<(), anyhow::Error> {
+    let spinner = start_spinner("Parsing files...", format);
+    let discovery = discover_files(path, &DiscoveryOptions::default())?;
+
+    let mut parsed_files = Vec::new();
+    for file in discovery.files {
+        match parse_file(&file) {
+            Ok(parsed) => parsed_files.push((file, parsed.chunks)),
+            Err(err) => report_failure(&format!("Failed to parse {}: {}", file.display(), err), format),
+        }
+    }
+    spinner.finish_and_clear();
+
+    let total_chunks: usize = parsed_files.iter().map(|(_, chunks)| chunks.len()).sum();
+    if format.is_json() {
+        emit(json!({
+            "total_chunks": total_chunks,
+            "files": parsed_files.iter().map(|(path, chunks)| json!({
+                "path": path.to_string_lossy(),
+                "chunks": chunks.iter().map(|chunk| json!({
+                    "name": chunk.name,
+                    "kind": chunk.chunk_type,
+                    "parent": chunk.parent,
+                    "start_line": chunk.start_line,
+                    "end_line": chunk.end_line,
+                })).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+        }));
+        return Ok(());
+    }
+
+    for (path, chunks) in &parsed_files {
+        if chunks.is_empty() {
+            continue;
+        }
+        println!("\n{} {}", "File:".magenta().bold(), path.display().to_string().underline());
+        for chunk in chunks {
+            println!(
+                "  [{}] name: '{}' (lines {}-{})",
+                chunk.chunk_type.yellow(),
+                chunk.name.blue().bold(),
+                chunk.start_line,
+                chunk.end_line
+            );
+        }
+    }
+    println!("\n{} Total logical chunks found: {}", "✓ Parsing completed.".green().bold(), total_chunks.to_string().bold().yellow());
+    Ok(())
+}
+
+fn progress_bar(length: u64, format: OutputFormat) -> ProgressBar {
+    match format.is_json() {
+        true => ProgressBar::hidden(),
+        false => ProgressBar::new(length),
+    }
+}
+
+fn index_summary_json(
+    project_root: &Path,
+    plan: &IndexPlan,
+    outcome: &IndexOutcome,
+    up_to_date: bool,
+) -> serde_json::Value {
+    json!({
+        "project": project_root.to_string_lossy(),
+        "up_to_date": up_to_date,
+        "new_files": plan.new_files.len(),
+        "changed_files": plan.changed_files.len(),
+        "unchanged_files": plan.unchanged_count(),
+        "removed_files": plan.removed_paths.len(),
+        "chunks_stored": outcome.stored_chunks,
+        "files_stored": outcome.stored_files,
+        "skipped_chunks": outcome.skipped_chunks,
+    })
+}
+
+// Progress belongs to a person reading along, not to a caller parsing JSON.
+fn start_spinner(message: &str, format: OutputFormat) -> ProgressBar {
+    if format.is_json() {
+        return ProgressBar::hidden();
+    }
+    let spinner = ProgressBar::new_spinner();
+    spinner.enable_steady_tick(Duration::from_millis(100));
+    spinner.set_message(message.to_string());
+    spinner
+}
+
+fn print_checks(checks: &[doctor::Check], format: OutputFormat) {
+    if format.is_json() {
+        emit(json!({
+            "checks": checks.iter().map(|check| json!({
+                "name": check.name,
+                "status": match check.status {
+                    doctor::Status::Ok => "ok",
+                    doctor::Status::Warning => "warning",
+                    doctor::Status::Failed => "failed",
+                },
+                "detail": check.detail,
+            })).collect::<Vec<_>>(),
+            "failures": checks.iter().filter(|check| check.status == doctor::Status::Failed).count(),
+            "warnings": checks.iter().filter(|check| check.status == doctor::Status::Warning).count(),
+        }));
+        return;
+    }
+
     crate::ui::formatter::print_section("cbq doctor");
     for check in checks {
         let (mark, detail) = match check.status {
@@ -909,10 +1167,26 @@ fn print_checks(checks: &[doctor::Check]) {
     }
 }
 
-fn print_status(directory: &Path) -> Result<(), anyhow::Error> {
+fn print_status(directory: &Path, format: OutputFormat) -> Result<(), anyhow::Error> {
     let Some(summary) = doctor::summarise_index(directory)? else {
         return Err(missing_index_error(directory));
     };
+    if format.is_json() {
+        emit(json!({
+            "project": summary.project_root,
+            "files": summary.indexed_files,
+            "chunks": summary.total_chunks,
+            "languages": summary.languages,
+            "embedding_model": summary.embedding_model,
+            "indexed_at": summary.indexed_at,
+            "size_bytes": summary.size_bytes,
+            "stale": summary.is_stale(),
+            "new_files": summary.new_files,
+            "changed_files": summary.changed_files,
+            "removed_files": summary.removed_files,
+        }));
+        return Ok(());
+    }
 
     crate::ui::formatter::print_section(&summary.project_root);
     let is_stale = summary.is_stale();
@@ -940,8 +1214,25 @@ fn print_status(directory: &Path) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-fn list_indexes() -> Result<(), anyhow::Error> {
+fn list_indexes(format: OutputFormat) -> Result<(), anyhow::Error> {
     let index_dirs = index_directories()?;
+    if format.is_json() {
+        let mut indexes = Vec::new();
+        for index_dir in &index_dirs {
+            let db_path = index_database_in(index_dir);
+            let conn = open_index(&db_path)?;
+            let stats = get_db_stats(&conn)?;
+            indexes.push(json!({
+                "project": read_meta(&conn, PROJECT_ROOT_KEY)?,
+                "index_dir": index_dir.to_string_lossy(),
+                "files": stats.indexed_files,
+                "chunks": stats.total_chunks,
+                "size_bytes": std::fs::metadata(&db_path).map(|file| file.len()).unwrap_or(0),
+            }));
+        }
+        emit(json!({ "indexes": indexes }));
+        return Ok(());
+    }
     if index_dirs.is_empty() {
         println!("No projects indexed yet.");
         return Ok(());
@@ -969,7 +1260,12 @@ fn list_indexes() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-fn clean_indexes(directory: &Path, all: bool, skip_confirmation: bool) -> Result<(), anyhow::Error> {
+fn clean_indexes(
+    directory: &Path,
+    all: bool,
+    skip_confirmation: bool,
+    format: OutputFormat,
+) -> Result<(), anyhow::Error> {
     let targets = match all {
         true => index_directories()?,
         false => {
@@ -982,9 +1278,11 @@ fn clean_indexes(directory: &Path, all: bool, skip_confirmation: bool) -> Result
         return Ok(());
     }
 
-    println!("This deletes {}:", count_of("index", targets.len()));
-    for index_dir in &targets {
-        println!("  {}", index_dir.display());
+    if format.is_text() {
+        println!("This deletes {}:", count_of("index", targets.len()));
+        for index_dir in &targets {
+            println!("  {}", index_dir.display());
+        }
     }
     if !skip_confirmation && !confirmed()? {
         println!("Nothing was deleted.");
@@ -993,6 +1291,10 @@ fn clean_indexes(directory: &Path, all: bool, skip_confirmation: bool) -> Result
 
     for index_dir in &targets {
         std::fs::remove_dir_all(index_dir)?;
+    }
+    if format.is_json() {
+        emit(json!({ "deleted": targets.iter().map(|dir| dir.to_string_lossy()).collect::<Vec<_>>() }));
+        return Ok(());
     }
     crate::ui::formatter::print_success_msg(&format!("Deleted {}", count_of("index", targets.len())));
     Ok(())
@@ -1012,9 +1314,27 @@ fn confirmed() -> Result<bool, anyhow::Error> {
     Ok(answer.trim().eq_ignore_ascii_case("y"))
 }
 
-fn show_history(directory: &Path, limit: usize) -> Result<(), anyhow::Error> {
+fn show_history(directory: &Path, limit: usize, format: OutputFormat) -> Result<(), anyhow::Error> {
     let (project, conn) = locate_and_open_index(directory)?;
     let turns = read_turns(&conn, limit)?;
+    if format.is_json() {
+        emit(json!({
+            "project": project.root.to_string_lossy(),
+            "turns": turns.iter().map(|turn| json!({
+                "asked_at": turn.asked_at,
+                "session_id": turn.session_id,
+                "question": turn.question,
+                "answer": turn.answer,
+                "citations": turn.citations.iter().map(|citation| json!({
+                    "path": citation.file_path,
+                    "start_line": citation.start_line,
+                    "end_line": citation.end_line,
+                    "score": round_score(citation.score),
+                })).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+        }));
+        return Ok(());
+    }
     if turns.is_empty() {
         println!("No questions recorded for {} yet.", project.root.display());
         print_legacy_history_note();
@@ -1044,7 +1364,7 @@ fn show_history(directory: &Path, limit: usize) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-fn export_history(directory: &Path, output: Option<&Path>) -> Result<(), anyhow::Error> {
+fn export_history(directory: &Path, output: Option<&Path>, format: OutputFormat) -> Result<(), anyhow::Error> {
     let (project, conn) = locate_and_open_index(directory)?;
     let turns = read_turns(&conn, count_turns(&conn)?)?;
     anyhow::ensure!(!turns.is_empty(), "No questions recorded for {} yet", project.root.display());
@@ -1058,6 +1378,10 @@ fn export_history(directory: &Path, output: Option<&Path>) -> Result<(), anyhow:
     }
     std::fs::write(&export_path, render_transcript(&turns, &project.root))?;
 
+    if format.is_json() {
+        emit(json!({ "path": export_path.to_string_lossy(), "questions": turns.len() }));
+        return Ok(());
+    }
     crate::ui::formatter::print_success_msg(&format!(
         "Exported {} to: {}",
         count_of("question", turns.len()),
@@ -1104,7 +1428,7 @@ fn missing_index_error(directory: &Path) -> anyhow::Error {
     anyhow::anyhow!(message)
 }
 
-async fn run_search(query: &str, limit: Option<usize>, directory: &Path) {
+async fn run_search(query: &str, limit: Option<usize>, directory: &Path, format: OutputFormat) {
     let config = match load_config() {
         Ok(c) => c,
         Err(_) => {
@@ -1118,7 +1442,7 @@ async fn run_search(query: &str, limit: Option<usize>, directory: &Path) {
     let (project, conn) = match open_project_index(directory, &config) {
         Ok(opened) => opened,
         Err(err) => {
-            print_error(&format!("{}", err));
+            report_failure(&format!("{}", err), format);
             std::process::exit(1);
         }
     };
@@ -1127,21 +1451,23 @@ async fn run_search(query: &str, limit: Option<usize>, directory: &Path) {
     let ollama = match prepare_ollama(&config, &models).await {
         Ok(ollama) => ollama,
         Err(err) => {
-            print_error(&format!("{:#}", err));
+            report_failure(&format!("{:#}", err), format);
             std::process::exit(1);
         }
     };
 
-    println!(
-        "Searching {} for: '{}'...",
-        project.root.display().to_string().dimmed(),
-        query.cyan()
-    );
+    if format.is_text() {
+        println!(
+            "Searching {} for: '{}'...",
+            project.root.display().to_string().dimmed(),
+            query.cyan()
+        );
+    }
 
     let query_vector = match embed_query(&ollama, &config.ollama.embedding_model, query).await {
         Ok(vec) => vec,
         Err(err) => {
-            print_error(&format!("Failed to generate embedding for query: {}", err));
+            report_failure(&format!("Failed to generate embedding for query: {}", err), format);
             std::process::exit(1);
         }
     };
@@ -1149,28 +1475,40 @@ async fn run_search(query: &str, limit: Option<usize>, directory: &Path) {
     let vectors = match load_chunk_vectors(&conn) {
         Ok(vectors) => vectors,
         Err(err) => {
-            print_error(&format!("{}", err));
+            report_failure(&format!("{}", err), format);
             std::process::exit(1);
         }
     };
-    match find_relevant_chunks(&conn, &vectors, query, &query_vector, limit) {
+    match find_relevant_chunks(&conn, &vectors, query, &query_vector, candidate_count(limit, &config)) {
         Ok(results) => {
-            if results.is_empty() {
+            let results = rerank_results(&ollama, &config, query, results, limit).await;
+            if results.is_empty() && format.is_text() {
                 println!("{}", "This project has no indexed chunks yet. Run `cbq index` first.".yellow());
                 return;
             }
-            print_search_results(&results, config.search.similarity_threshold);
+            if format.is_text() {
+                print_search_results(&results, config.search.similarity_threshold);
+                println!("{}", "🤖 [Ollama LLM Response]".blue().bold());
+            }
 
-            println!("{}", "🤖 [Ollama LLM Response]".blue().bold());
             let prompt = build_prompt(query, &results, &[]);
-            let answer = match stream_answer(&ollama, &config.ollama.chat_model, &prompt).await {
+            let answer = match stream_answer(&ollama, &config.ollama.chat_model, &prompt, format).await {
                 Ok(answer) => Some(answer),
                 Err(err) => {
-                    print_error(&format!("Failed to get LLM response: {:#}", err));
+                    report_failure(&format!("Failed to get LLM response: {:#}", err), format);
                     None
                 }
             };
-            println!("\n");
+            if format.is_json() {
+                emit(json!({
+                    "query": query,
+                    "project": project.root.to_string_lossy(),
+                    "results": results.iter().map(search_result_json).collect::<Vec<_>>(),
+                    "answer": answer,
+                }));
+            } else {
+                println!("\n");
+            }
 
             let turn = RecordedTurn {
                 session_id: new_session_id(),
@@ -1184,14 +1522,25 @@ async fn run_search(query: &str, limit: Option<usize>, directory: &Path) {
             }
         }
         Err(err) => {
-            print_error(&format!("Search failed: {}", err));
+            report_failure(&format!("Search failed: {}", err), format);
             std::process::exit(1);
         }
     }
 }
 
 // The answer is printed as it arrives; the spinner only covers the wait for the first words.
-async fn stream_answer(ollama: &Ollama, chat_model: &str, prompt: &str) -> Result<String, anyhow::Error> {
+async fn stream_answer(
+    ollama: &Ollama,
+    chat_model: &str,
+    prompt: &str,
+    format: OutputFormat,
+) -> Result<String, anyhow::Error> {
+    if format.is_json() {
+        let mut answer = String::new();
+        ollama.generate_stream(chat_model, prompt, |chunk| answer.push_str(chunk)).await?;
+        return Ok(answer);
+    }
+
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(
         ProgressStyle::default_spinner()
@@ -1219,8 +1568,8 @@ async fn stream_answer(ollama: &Ollama, chat_model: &str, prompt: &str) -> Resul
     Ok(answer)
 }
 
-async fn run_chat_repl(directory: &Path) -> Result<(), anyhow::Error> {
-    use std::io::{self, Write};
+async fn run_chat_repl(directory: &Path, format: OutputFormat) -> Result<(), anyhow::Error> {
+
 
     let config = match load_config() {
         Ok(c) => c,
@@ -1233,29 +1582,35 @@ async fn run_chat_repl(directory: &Path) -> Result<(), anyhow::Error> {
 
     let (project, conn) = open_project_index(directory, &config)?;
 
-    println!("Checking Ollama connection...");
+    if format.is_text() {
+        println!("Checking Ollama connection...");
+    }
     let models = [config.ollama.embedding_model.as_str(), config.ollama.chat_model.as_str()];
     let ollama = prepare_ollama(&config, &models).await?;
     let vectors = load_chunk_vectors(&conn)?;
     let session = Session { config: &config, ollama: &ollama, conn: &conn, vectors, session_id: new_session_id() };
 
-    println!("\n🤖 {}", format!("Codebase chat started for {}.", project.root.display()).cyan().bold());
-    println!("Type 'exit' or 'quit' to end the session, or '/clear' to start a new conversation.");
-    println!("Using embedding model: {}\n", config.ollama.embedding_model.yellow());
+    if format.is_text() {
+        println!("\n🤖 {}", format!("Codebase chat started for {}.", project.root.display()).cyan().bold());
+        println!("Type 'exit' or 'quit' to end the session, or '/clear' to start a new conversation.");
+        println!("Using embedding model: {}\n", config.ollama.embedding_model.yellow());
+    }
 
     let mut history: Vec<ChatTurn> = Vec::new();
+    let mut editor = LineEditor::new();
 
     loop {
-        print!("{} ", ">".green().bold());
-        io::stdout().flush()?;
-
-        let mut input = String::new();
-        let bytes_read = io::stdin().read_line(&mut input)?;
-        if bytes_read == 0 {
-            println!(); // Ctrl-D leaves the cursor on the prompt line
-            break;
-        }
-        let question = input.trim();
+        let prompt = match format.is_text() {
+            true => "> ",
+            false => "",
+        };
+        let line = match editor.read_line(prompt)? {
+            Input::Line(line) => line,
+            // Ctrl-C abandons the line being typed; Ctrl-D ends the session.
+            Input::Interrupted => continue,
+            Input::EndOfInput => break,
+        };
+        let question = line.trim();
 
         if question.is_empty() {
             continue;
@@ -1265,18 +1620,22 @@ async fn run_chat_repl(directory: &Path) -> Result<(), anyhow::Error> {
         }
         if question == "/clear" {
             history.clear();
-            println!("{}", "Conversation cleared.".cyan());
+            if format.is_text() {
+                println!("{}", "Conversation cleared.".cyan());
+            }
             continue;
         }
 
-        match answer_chat_question(&session, &history, question).await {
+        match answer_chat_question(&session, &history, question, format).await {
             Ok(Some(answer)) => history.push(ChatTurn { question: question.to_string(), answer }),
             Ok(None) => {}
-            Err(err) => print_error(&format!("{:#}", err)),
+            Err(err) => report_failure(&format!("{:#}", err), format),
         }
     }
 
-    println!("{}", "Exiting chat mode. Goodbye!".cyan());
+    if format.is_text() {
+        println!("{}", "Exiting chat mode. Goodbye!".cyan());
+    }
     Ok(())
 }
 
@@ -1285,36 +1644,56 @@ async fn answer_chat_question(
     session: &Session<'_>,
     history: &[ChatTurn],
     question: &str,
+    format: OutputFormat,
 ) -> Result<Option<String>, anyhow::Error> {
     let config = session.config;
-    println!("Searching for matches...");
+    if format.is_text() {
+        println!("Searching for matches...");
+    }
     let search_query = standalone_question(session, history, question).await;
-    if search_query != question {
+    if search_query != question && format.is_text() {
         println!("{} {}", "↳ searching for:".dimmed(), search_query.dimmed());
     }
 
     let query_vector = embed_query(session.ollama, &config.ollama.embedding_model, &search_query)
         .await
         .context("Failed to generate embedding")?;
-    let results = find_relevant_chunks(session.conn, &session.vectors, &search_query, &query_vector, config.search.top_k)
-        .context("Search failed")?;
+    let candidates = find_relevant_chunks(
+        session.conn,
+        &session.vectors,
+        &search_query,
+        &query_vector,
+        candidate_count(config.search.top_k, config),
+    )
+    .context("Search failed")?;
+    let results = rerank_results(session.ollama, config, &search_query, candidates, config.search.top_k).await;
 
-    if results.is_empty() && history.is_empty() {
+    if results.is_empty() && history.is_empty() && format.is_text() {
         println!("{}", "This project has no indexed chunks yet. Run `cbq index` first.".yellow());
         return Ok(None);
     }
-    if results.is_empty() {
-        println!("{}", "No new code matched; answering from the conversation so far.".dimmed());
-    } else {
-        print_search_results(&results, config.search.similarity_threshold);
+    if format.is_text() {
+        match results.is_empty() {
+            true => println!("{}", "No new code matched; answering from the conversation so far.".dimmed()),
+            false => print_search_results(&results, config.search.similarity_threshold),
+        }
+        println!("{}", "🤖 [Ollama LLM Response]".blue().bold());
     }
 
-    println!("{}", "🤖 [Ollama LLM Response]".blue().bold());
     let prompt = build_prompt(question, &results, history);
-    let answer = stream_answer(session.ollama, &config.ollama.chat_model, &prompt)
+    let answer = stream_answer(session.ollama, &config.ollama.chat_model, &prompt, format)
         .await
         .context("Failed to get LLM response")?;
-    println!();
+    // One object per answer, so a caller can read a conversation as it happens.
+    match format.is_json() {
+        true => emit(json!({
+            "question": question,
+            "search_query": search_query,
+            "results": results.iter().map(search_result_json).collect::<Vec<_>>(),
+            "answer": answer,
+        })),
+        false => println!(),
+    }
 
     let turn = RecordedTurn {
         session_id: session.session_id.clone(),
@@ -1434,29 +1813,40 @@ fn shorten(text: &str, max_chars: usize) -> String {
     }
 }
 
-async fn run_analyze(directory: &Path, requested_source: Option<DiffSource>) -> Result<(), anyhow::Error> {
+async fn run_analyze(
+    directory: &Path,
+    requested_source: Option<DiffSource>,
+    format: OutputFormat,
+) -> Result<(), anyhow::Error> {
     let config = match load_config() {
         Ok(c) => c,
         Err(_) => crate::config::settings::Config::default(),
     };
 
-    let diff_text = read_diff(directory, requested_source).await?;
+    let diff_text = read_diff(directory, requested_source, format).await?;
     let files = parse_diff(&diff_text);
     if files.iter().all(|file| file.hunks.is_empty()) {
-        println!("{}", "No changes to analyze.".yellow());
+        match format.is_json() {
+            true => emit(json!({ "files": [], "review": null })),
+            false => println!("{}", "No changes to analyze.".yellow()),
+        }
         return Ok(());
     }
-    print_changed_files(&files);
+    if format.is_text() {
+        print_changed_files(&files);
+    }
 
     // Checked before pulling models, so a mismatched embedding model isn't downloaded only to be rejected.
     let index = match find_indexed_project(directory)? {
         Some(_) => Some(open_project_index(directory, &config)?),
         None => {
-            println!(
-                "{}",
-                "No index found, so the review won't include related code. Run `cbq index <project-dir>` to add it."
-                    .yellow()
-            );
+            if format.is_text() {
+                println!(
+                    "{}",
+                    "No index found, so the review won't include related code. Run `cbq index <project-dir>` to add it."
+                        .yellow()
+                );
+            }
             None
         }
     };
@@ -1479,28 +1869,61 @@ async fn run_analyze(directory: &Path, requested_source: Option<DiffSource>) -> 
         }
         None => Vec::new(),
     };
-    if index.is_some() {
+    if index.is_some() && format.is_text() {
         print_impacted_callers(&impacted);
         print_related_code(&related);
     }
 
     let prompt = build_review_prompt(&files, &related, &impacted);
-    if prompt.omitted_hunks > 0 {
-        println!(
-            "{}",
-            format!("{} hunks were left out of the review to fit the model's context.", prompt.omitted_hunks).dimmed()
-        );
+    if format.is_text() {
+        if prompt.omitted_hunks > 0 {
+            println!(
+                "{}",
+                format!("{} hunks were left out of the review to fit the model's context.", prompt.omitted_hunks)
+                    .dimmed()
+            );
+        }
+        println!("{}", "🤖 [Ollama Review]".blue().bold());
     }
-    println!("{}", "🤖 [Ollama Review]".blue().bold());
-    stream_answer(&ollama, &config.ollama.chat_model, &prompt.text)
+
+    let review = stream_answer(&ollama, &config.ollama.chat_model, &prompt.text, format)
         .await
         .context("Failed to get the review")?;
+    if format.is_json() {
+        emit(json!({
+            "files": files.iter().map(|file| {
+                let (added, removed) = file.line_counts();
+                json!({
+                    "path": file.path,
+                    "change": describe_change(&file.change),
+                    "added_lines": added,
+                    "removed_lines": removed,
+                })
+            }).collect::<Vec<_>>(),
+            "impacted": impacted.iter().map(|symbol| json!({
+                "symbol": symbol.symbol,
+                "callers": symbol.callers.iter().map(|caller| json!({
+                    "path": caller.file_path,
+                    "line": caller.line,
+                    "caller": caller.caller,
+                })).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+            "related": related.iter().map(search_result_json).collect::<Vec<_>>(),
+            "omitted_hunks": prompt.omitted_hunks,
+            "review": review,
+        }));
+        return Ok(());
+    }
     println!();
     Ok(())
 }
 
 // A piped diff wins; otherwise git is asked for the requested changes, defaulting to everything uncommitted.
-async fn read_diff(directory: &Path, requested_source: Option<DiffSource>) -> Result<String, anyhow::Error> {
+async fn read_diff(
+    directory: &Path,
+    requested_source: Option<DiffSource>,
+    format: OutputFormat,
+) -> Result<String, anyhow::Error> {
     use std::io::{IsTerminal, Read};
 
     let source = match requested_source {
@@ -1512,7 +1935,9 @@ async fn read_diff(directory: &Path, requested_source: Option<DiffSource>) -> Re
         }
         None => DiffSource::Uncommitted,
     };
-    println!("{}", format!("Reviewing {}", describe_diff_source(&source)).dimmed());
+    if format.is_text() {
+        println!("{}", format!("Reviewing {}", describe_diff_source(&source)).dimmed());
+    }
     read_git_diff(directory, &source).await
 }
 

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use ignore::overrides::{Override, OverrideBuilder};
 use ignore::WalkBuilder;
 use crate::services::parser::extension_to_language_name;
 use crate::services::secrets::is_secret_file_name;
@@ -58,11 +59,19 @@ pub struct DiscoveryOptions {
     pub max_file_bytes: u64,
     /// Index files whose names mark them as credentials; off by default.
     pub allow_secrets: bool,
+    /// When any are given, only files matching them are indexed.
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
 }
 
 impl Default for DiscoveryOptions {
     fn default() -> Self {
-        Self { max_file_bytes: DEFAULT_MAX_FILE_BYTES, allow_secrets: false }
+        Self {
+            max_file_bytes: DEFAULT_MAX_FILE_BYTES,
+            allow_secrets: false,
+            include: Vec::new(),
+            exclude: Vec::new(),
+        }
     }
 }
 
@@ -79,6 +88,7 @@ pub fn discover_files(root_path: &Path, options: &DiscoveryOptions) -> Result<Fi
         .git_ignore(true)
         .require_git(false)
         .add_custom_ignore_filename(IGNORE_FILE_NAME)
+        .overrides(build_overrides(root_path, options)?)
         .filter_entry(|entry| !is_skipped_directory(entry))
         .build();
 
@@ -123,12 +133,35 @@ pub fn discover_files(root_path: &Path, options: &DiscoveryOptions) -> Result<Fi
     Ok(result)
 }
 
+// An --include glob is a whitelist: once one is given, everything it doesn't match is left out.
+fn build_overrides(root_path: &Path, options: &DiscoveryOptions) -> Result<Override, anyhow::Error> {
+    let mut overrides = OverrideBuilder::new(root_path);
+    for pattern in &options.include {
+        overrides.add(pattern).map_err(|err| anyhow::anyhow!("Invalid --include pattern '{}': {}", pattern, err))?;
+    }
+    for pattern in &options.exclude {
+        overrides
+            .add(&format!("!{}", pattern))
+            .map_err(|err| anyhow::anyhow!("Invalid --exclude pattern '{}': {}", pattern, err))?;
+    }
+    Ok(overrides.build()?)
+}
+
 fn is_skipped_directory(entry: &ignore::DirEntry) -> bool {
     let is_directory = entry.file_type().is_some_and(|file_type| file_type.is_dir());
     // Depth 0 is the project root itself, which is indexed whatever it's called.
     is_directory
         && entry.depth() > 0
         && entry.file_name().to_str().is_some_and(|name| SKIPPED_DIRECTORY_NAMES.contains(&name))
+}
+
+/// Reports whether a path is one cbq would index, used to ignore irrelevant file-system events.
+pub fn looks_indexable(path: &Path) -> bool {
+    let inside_skipped_directory = path
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .any(|name| SKIPPED_DIRECTORY_NAMES.contains(&name));
+    !inside_skipped_directory && indexable_extension(path).is_some()
 }
 
 fn indexable_extension(path: &Path) -> Option<String> {
@@ -212,6 +245,18 @@ mod tests {
     }
 
     #[test]
+    fn a_source_file_is_worth_reacting_to() {
+        assert!(looks_indexable(Path::new("/project/src/cart.rs")));
+    }
+
+    #[test]
+    fn a_build_artefact_is_not_worth_reacting_to() {
+        assert!(!looks_indexable(Path::new("/project/target/debug/build.rs")));
+        assert!(!looks_indexable(Path::new("/project/.git/COMMIT_EDITMSG")));
+        assert!(!looks_indexable(Path::new("/project/notes.bin")));
+    }
+
+    #[test]
     fn dependency_and_vcs_directories_are_not_walked() {
         let root = project_with(&[
             ("src/lib.rs", "fn a() {}"),
@@ -242,6 +287,39 @@ mod tests {
     fn gitignore_is_honored_outside_a_git_repository() {
         let root = project_with(&[(".gitignore", "out/\n"), ("src/lib.rs", "fn a() {}"), ("out/gen.rs", "x")]);
         assert_eq!(discovered_names(root.path()), vec!["src/lib.rs"]);
+    }
+
+    #[test]
+    fn only_included_patterns_are_scanned() {
+        let root = project_with(&[("src/lib.rs", "fn a() {}"), ("docs/guide.md", "# Guide"), ("web/app.js", "x")]);
+        let options = DiscoveryOptions { include: vec!["*.rs".to_string()], ..DiscoveryOptions::default() };
+        let found: Vec<String> = discover_files(root.path(), &options)
+            .unwrap()
+            .files
+            .iter()
+            .map(|path| path.strip_prefix(root.path()).unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(found, vec!["src/lib.rs"]);
+    }
+
+    #[test]
+    fn excluded_patterns_are_left_out() {
+        let root = project_with(&[("src/lib.rs", "fn a() {}"), ("src/generated.rs", "fn b() {}")]);
+        let options = DiscoveryOptions { exclude: vec!["**/generated.rs".to_string()], ..DiscoveryOptions::default() };
+        let found: Vec<String> = discover_files(root.path(), &options)
+            .unwrap()
+            .files
+            .iter()
+            .map(|path| path.strip_prefix(root.path()).unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(found, vec!["src/lib.rs"]);
+    }
+
+    #[test]
+    fn an_invalid_pattern_is_reported() {
+        let root = project_with(&[("src/lib.rs", "fn a() {}")]);
+        let options = DiscoveryOptions { include: vec!["[".to_string()], ..DiscoveryOptions::default() };
+        assert!(discover_files(root.path(), &options).is_err());
     }
 
     #[test]

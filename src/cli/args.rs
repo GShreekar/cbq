@@ -17,6 +17,34 @@ pub struct Cli {
         required = false
     )]
     pub default_query: Option<String>,
+
+    #[arg(
+        long,
+        global = true,
+        help = "Print results as JSON instead of prose, for editors and scripts"
+    )]
+    pub json: bool,
+}
+
+/// Which files a scan looks at.
+#[derive(clap::Args, Debug)]
+pub struct ScanArgs {
+    #[arg(
+        long = "max-file-size",
+        value_name = "KB",
+        help = "Skip files larger than this many kilobytes",
+        default_value_t = 512
+    )]
+    pub max_file_size_kb: u64,
+
+    #[arg(long, help = "Index files that look like they hold credentials, which are skipped by default")]
+    pub allow_secrets: bool,
+
+    #[arg(long, value_name = "GLOB", help = "Only look at files matching this pattern; repeatable")]
+    pub include: Vec<String>,
+
+    #[arg(long, value_name = "GLOB", help = "Leave out files matching this pattern; repeatable")]
+    pub exclude: Vec<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -25,6 +53,9 @@ pub enum Commands {
     Init {
         #[arg(help = "The target directory path to scan", default_value = "./")]
         path: PathBuf,
+
+        #[command(flatten)]
+        scan: ScanArgs,
     },
     #[command(about = "Parse code files in a directory and print detected chunks")]
     Parse {
@@ -39,16 +70,16 @@ pub enum Commands {
         #[arg(long, help = "Rebuild the whole index instead of updating only changed files")]
         force: bool,
 
-        #[arg(
-            long = "max-file-size",
-            value_name = "KB",
-            help = "Skip files larger than this many kilobytes",
-            default_value_t = 512
-        )]
-        max_file_size_kb: u64,
+        #[command(flatten)]
+        scan: ScanArgs,
+    },
+    #[command(about = "Index a directory, then keep it up to date as files change")]
+    Watch {
+        #[arg(help = "The target directory path to watch", default_value = "./")]
+        path: PathBuf,
 
-        #[arg(long, help = "Index files that look like they hold credentials, which are skipped by default")]
-        allow_secrets: bool,
+        #[command(flatten)]
+        scan: ScanArgs,
     },
     #[command(about = "Search the indexed codebase using keywords")]
     Search {
