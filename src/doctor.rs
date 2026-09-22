@@ -1,5 +1,5 @@
 use std::path::Path;
-use crate::config::settings::{cbq_home, load_config, Config};
+use crate::config::settings::{cbq_home, find_project_config, load_config, load_config_for, Config};
 use crate::db::index_metadata::{
     read_embedding_model, read_meta, CHUNK_FORMAT_KEY, DOCUMENT_PREFIX_KEY, GRAPH_VERSION_KEY, PROJECT_ROOT_KEY,
 };
@@ -92,14 +92,14 @@ pub fn summarise_index(directory: &Path) -> Result<Option<IndexSummary>, anyhow:
 /// Checks everything that has to hold for a question to be answered, and reports what doesn't.
 pub async fn run_checks(directory: &Path) -> Vec<Check> {
     let mut checks = Vec::new();
-    let config = match load_config() {
+    let config = match load_config_for(directory) {
         Ok(config) => {
-            checks.push(Check::ok("Configuration", describe_config_source()));
+            checks.push(Check::ok("Configuration", describe_config_source(directory)));
             config
         }
         Err(err) => {
-            checks.push(Check::warn("Configuration", format!("unreadable, using defaults: {}", err)));
-            Config::default()
+            checks.push(Check::warn("Configuration", format!("{}; using the global settings", err)));
+            load_config().unwrap_or_default()
         }
     };
 
@@ -109,11 +109,15 @@ pub async fn run_checks(directory: &Path) -> Vec<Check> {
     checks
 }
 
-fn describe_config_source() -> String {
-    match crate::config::settings::get_config_path() {
-        Ok(path) if path.exists() => format!("{}", path.display()),
+fn describe_config_source(directory: &Path) -> String {
+    let global = match crate::config::settings::get_config_path() {
+        Ok(path) if path.exists() => path.display().to_string(),
         Ok(path) => format!("{} (not written yet, using defaults)", path.display()),
         Err(err) => format!("cannot locate: {}", err),
+    };
+    match find_project_config(directory) {
+        Some(project) => format!("{}, overridden by {}", global, project.display()),
+        None => global,
     }
 }
 

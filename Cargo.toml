@@ -8,6 +8,7 @@ repository = "https://github.com/GShreekar/cbq"
 
 [dependencies]
 clap = { version = "4.4", features = ["derive"] }
+clap_complete = "4.5"
 ignore = "0.4"
 indicatif = "0.17"
 colored = "2.1"
@@ -19,7 +20,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
-tokio = { version = "1.35", features = ["rt-multi-thread", "macros", "time", "process"] }
+tokio = { version = "1.35", features = ["rt-multi-thread", "macros", "time", "process", "io-std", "io-util"] }
 # No TLS by default: cbq talks to Ollama over plain HTTP, and linking OpenSSL would make
 # installing cbq depend on system OpenSSL headers. `--features https` adds it back.
 reqwest = { version = "0.11", default-features = false, features = ["json", "stream"] }

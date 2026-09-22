@@ -13,3 +13,5 @@ pub mod search;
 pub mod secrets;
 pub mod symbols;
 pub mod rerank;
+pub mod citations;
+pub mod workspace;

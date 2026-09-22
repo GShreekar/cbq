@@ -90,6 +90,26 @@ pub enum Commands {
         limit: Option<usize>,
 
         #[arg(
+            short = 'A',
+            long,
+            help = "Search every indexed project, not just this one"
+        )]
+        all: bool,
+
+        #[arg(
+            short = 'C',
+            long,
+            help = "Project directory to use instead of the current one",
+            default_value = "."
+        )]
+        directory: PathBuf,
+    },
+    #[command(about = "Explain a file, or the code at one of its lines")]
+    Explain {
+        #[arg(help = "A file, optionally with a line: src/cart.rs or src/cart.rs:42")]
+        target: String,
+
+        #[arg(
             short = 'C',
             long,
             help = "Project directory to use instead of the current one",
@@ -174,6 +194,26 @@ pub enum Commands {
         )]
         directory: PathBuf,
     },
+    #[command(about = "Serve the index to editors and agents over the Model Context Protocol")]
+    Mcp {
+        #[arg(long, help = "Speak JSON-RPC over stdin and stdout (the only transport today)")]
+        stdio: bool,
+
+        #[arg(
+            short = 'C',
+            long,
+            help = "Project directory to serve instead of the current one",
+            default_value = "."
+        )]
+        directory: PathBuf,
+    },
+    #[command(about = "Print a shell completion script")]
+    Completions {
+        #[arg(help = "The shell to generate for", value_enum)]
+        shell: clap_complete::Shell,
+    },
+    #[command(about = "Print the manual page, in roff, for man or for installing")]
+    Man,
     #[command(about = "Manage global configuration settings")]
     Config {
         #[command(subcommand)]

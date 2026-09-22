@@ -18,6 +18,8 @@ No code is ever uploaded to the cloud—everything runs entirely on your local m
 - **Intelligent Chunker**: Parses files with `tree-sitter` into logical units rather than line windows. Each chunk keeps the doc comments, decorators and attributes written above it; a type is indexed as a skeleton of its member signatures while each method is indexed on its own, so nothing is stored twice; functions assigned to a name (`const debounce = () => {}`) are indexed under that name; and every file gets a module chunk holding its imports, top-level constants and the list of symbols it defines.
 - **Context-Enriched Embeddings**: What gets embedded is the code behind a header naming its file, language, symbol and enclosing type, so a method called `add` is not just the word `add` in a vacuum.
 - **Model Auto-Provisioning**: Checks whether the configured models are on your Ollama server and pulls any that are missing, over Ollama's HTTP API, so Ollama running in Docker or on another machine works too.
+- **Works as a Tool for Other Agents**: `cbq mcp --stdio` serves the index over the Model Context Protocol, so Claude Code, Cursor or Zed can search your codebase and follow symbols without reading half of it into their context.
+- **Answers Are Checked Against the Index**: every `file:line` an answer cites is verified against what cbq actually indexed, and any that points at a file or line that isn't there is flagged rather than left to look authoritative.
 - **History & Export**: Every question, its answer and the code it cited are recorded in that project's own index; review them with `cbq history` or export a Markdown transcript.
 
 ---
@@ -209,6 +211,26 @@ Once the codebase is indexed, you can run queries.
   cbq search "database initialization" -C ~/code/other-project
   ```
 
+- **Searching every project at once**:
+  `--all` searches every codebase you have indexed and merges the results into one ranking, so you can
+  ask where something lives without knowing which repository holds it. Results are labelled with the
+  full path, so each one says which project it came from.
+  ```bash
+  cbq search "how do we sign webhook payloads?" --all
+  ```
+  Only indexes built with your configured embedding model take part: vectors from different models
+  mean different things and their scores cannot be compared. Any index left out is named, with the
+  reason, so the result never quietly covers less than you asked for. A workspace search is not
+  recorded in `cbq history`, because its answer belongs to no single project.
+
+- **Explaining a file, or one line of it**:
+  ```bash
+  cbq explain src/cart.rs          # what this file is for
+  cbq explain src/cart.rs:42       # the symbol at line 42, what it calls, and what calls it
+  ```
+  With a line number, cbq finds the smallest indexed symbol covering that line and pulls in its callers
+  and callees from the call graph, so the explanation covers how the code is reached and what it depends on.
+
 - **Interactive Chat REPL**:
   Start a persistent chat session to explore your codebase interactively.
   ```bash
@@ -304,6 +326,23 @@ Manage your configurations globally. Configurations are stored inside `~/.cbq/co
   cbq config set ollama.parallelism 4
   ```
 
+- **Per-project settings**:
+  A `.cbq.toml` in a project (or any directory above it) overrides the global settings for work done
+  inside that project, so a repository can ship the models and search settings it is meant to be read
+  with. Only the keys you write are overridden; everything else falls back to `~/.cbq/config.toml`.
+  ```toml
+  # .cbq.toml, committed alongside the code
+  [ollama]
+  chat_model = "qwen2.5-coder:7b"
+
+  [search]
+  top_k = 8
+  rerank = true
+  ```
+  **The Ollama address is deliberately not overridable.** `host`, `port` and `allow_remote` can only be
+  set globally, by you. A `.cbq.toml` arrives with code you cloned, and a repository must not be able to
+  redirect where your source code gets sent. `cbq doctor` names which file each setting came from.
+
 #### Default Configurations
 ```toml
 [ollama]
@@ -330,6 +369,88 @@ project's own eval it moved MRR from 0.950 to 1.000, but roughly tripled the tim
 is off by default.
 
 `similarity_threshold` marks weak matches in search results rather than hiding them; in `cbq analyze` it does filter, so unrelated code is kept out of the review.
+
+---
+
+## Using cbq from another agent (MCP)
+
+`cbq mcp --stdio` serves the index over the Model Context Protocol, speaking JSON-RPC 2.0 on stdin and
+stdout. This lets a coding agent search your codebase and follow symbols against the index you already
+built, instead of reading files into its context until it runs out.
+
+```bash
+cbq mcp --stdio                 # serves the project in the current directory
+cbq mcp --stdio -C ~/code/api   # serves another project
+```
+
+Register it with any MCP client. For Claude Code:
+
+```bash
+claude mcp add cbq -- cbq mcp --stdio -C /absolute/path/to/your/project
+```
+
+Or by hand, in the client's server configuration:
+
+```json
+{
+  "mcpServers": {
+    "cbq": {
+      "command": "cbq",
+      "args": ["mcp", "--stdio", "-C", "/absolute/path/to/your/project"]
+    }
+  }
+}
+```
+
+It offers four tools:
+
+| Tool | What it does | Needs a model? |
+|---|---|---|
+| `search_code` | Hybrid search over the codebase, returning the matching code | Yes, to embed the query |
+| `find_definition` | Where a symbol is defined, with its source | No |
+| `find_references` | Everywhere a symbol is used, and the symbol that uses it | No |
+| `project_status` | Files, chunks, languages, and whether the index is stale | No |
+
+No answer is generated: the tools return code, and whatever called them does the reasoning. Three of the
+four touch nothing but SQLite and return immediately.
+
+The server needs an index (`cbq index`) and, for `search_code`, the configured embedding model already
+pulled — it will not pull one itself, since download progress would corrupt the protocol stream. Nothing
+but JSON-RPC is ever written to stdout; diagnostics go to stderr.
+
+---
+
+## Shell completions and the manual page
+
+```bash
+# Completions: bash, zsh, fish, elvish or powershell
+cbq completions zsh > "${fpath[1]}/_cbq"
+cbq completions bash | sudo tee /etc/bash_completion.d/cbq
+cbq completions fish > ~/.config/fish/completions/cbq.fish
+
+# Manual page
+cbq man | sudo tee /usr/share/man/man1/cbq.1 > /dev/null
+cbq man | man -l -          # read it without installing
+```
+
+Both are generated from the command definitions themselves, so they cannot drift out of step with
+`--help`.
+
+---
+
+## Answers that cite code are checked
+
+Whenever cbq answers a question, every `file:line` reference in the answer is checked against what is
+actually in the index. Any citation naming a file cbq has never indexed, or a line past the end of that
+file, is reported:
+
+```
+⚠ 1 citation not in the index, so the answer may be pointing at code that isn't there: src/billing.rs:340
+```
+
+This runs on `search`, `chat` and `explain`, and appears in `--json` output as `unverified_citations`,
+so a script can reject an answer that points at code that does not exist. Citations are verified, not
+removed — the answer is still shown, with the parts you should not trust pointed out.
 
 ---
 

@@ -232,6 +232,35 @@ pub fn delete_untracked_chunks(conn: &Connection) -> Result<usize, anyhow::Error
     Ok(conn.execute("DELETE FROM chunks WHERE file_path NOT IN (SELECT path FROM files)", [])?)
 }
 
+/// Reports the last line the index has seen of each file, for checking an answer's citations.
+pub fn file_lengths(conn: &Connection) -> Result<HashMap<String, usize>, anyhow::Error> {
+    let mut stmt = conn.prepare("SELECT file_path, MAX(end_line) FROM chunks GROUP BY file_path")?;
+    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Returns the chunks of one file, in the order they appear.
+pub fn chunks_in_file(conn: &Connection, file_path: &str) -> Result<Vec<CodeChunk>, anyhow::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT id, file_path, language, name, chunk_type, parent, content, start_line, end_line
+         FROM chunks WHERE file_path = ?1 ORDER BY start_line",
+    )?;
+    let rows = stmt.query_map([file_path], |row| Ok(read_chunk(row)?.1))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Returns the smallest chunk covering a line, which is the symbol written there.
+pub fn chunk_at_line(conn: &Connection, file_path: &str, line: usize) -> Result<Option<CodeChunk>, anyhow::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT id, file_path, language, name, chunk_type, parent, content, start_line, end_line
+         FROM chunks
+         WHERE file_path = ?1 AND start_line <= ?2 AND end_line >= ?2 AND chunk_type NOT IN ('module', 'general')
+         ORDER BY (end_line - start_line) ASC LIMIT 1",
+    )?;
+    let chunk = stmt.query_row(params![file_path, line as i64], |row| Ok(read_chunk(row)?.1)).optional()?;
+    Ok(chunk)
+}
+
 /// Fetches whole chunks by id, which is how search avoids loading source text it won't return.
 pub fn chunks_by_ids(conn: &Connection, ids: &[i64]) -> Result<HashMap<i64, CodeChunk>, anyhow::Error> {
     if ids.is_empty() {
