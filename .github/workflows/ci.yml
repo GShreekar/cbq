@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --locked --all-targets
+      - name: Test
+        # The suite is self-contained: no Ollama, no network, no index on disk.
+        run: cargo test --locked
+
+  windows:
+    name: Test (windows, not yet verified)
+    runs-on: windows-latest
+    # The unix-only paths are cfg-gated, but cbq has never been built on Windows. This job reports
+    # whether that holds without blocking a release until someone has confirmed it.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+
+  msrv:
+    name: Minimum supported Rust (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      # Checks the rust-version in Cargo.toml is true, so `cargo install cbq` fails for nobody
+      # who meets it.
+      - run: cargo build --locked
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Reports lints without gating: two known warnings predate this workflow. Add `-- -D warnings`
+      # once they are cleared.
+      - run: cargo clippy --locked --all-targets
+
+  package:
+    name: Package for crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Builds the crate exactly as it would be published, which catches a file left out of the
+      # package before a release does.
+      - run: cargo package --locked

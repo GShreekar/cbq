@@ -1,10 +1,15 @@
 [package]
 name = "cbq"
-version = "1.0.1"
+version = "1.1.0"
 edition = "2024"
+# Floor taken from the locked dependencies: libloading declares 1.88, above what edition 2024 needs.
+rust-version = "1.88"
 description = "Local-first codebase semantic Q&A and analysis CLI tool"
 license = "MIT"
 repository = "https://github.com/GShreekar/cbq"
+readme = "README.md"
+keywords = ["code-search", "semantic-search", "ollama", "rag", "cli"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 clap = { version = "4.4", features = ["derive"] }
