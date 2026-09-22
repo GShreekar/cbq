@@ -3,9 +3,10 @@ pub mod services;
 pub mod db;
 pub mod config;
 pub mod ui;
+pub mod doctor;
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 use anyhow::Context;
 use clap::Parser;
@@ -13,12 +14,11 @@ use cli::args::{Cli, Commands};
 use services::chunker::{CodeChunk, CHUNK_FORMAT_VERSION};
 use services::embeddings::{document_prefix, embed_documents, embed_query};
 use services::file_discovery::{discover_files, DiscoveryOptions, SkipReason, SkippedFile};
-use services::index_plan::{plan_index, read_source_file, IndexPlan, SourceFile};
+use services::index_plan::{plan_index, read_source_files, IndexPlan, SourceFile};
 use services::parser::{parse_file, parse_source};
 use services::symbols::Reference;
 use services::vector_search::{is_test_file, load_chunk_vectors, ChunkVectors, SearchResult};
 use services::search::find_relevant_chunks;
-use services::secrets::find_secret;
 use services::chat_history::{
     citations_from, count_turns, default_export_path, new_session_id, now_timestamp, read_turns, record_turn,
     render_transcript, RecordedTurn,
@@ -233,6 +233,20 @@ async fn main() {
         }
         Some(Commands::Callers { symbol, directory }) => {
             if let Err(err) = show_references(&symbol, &directory, true) {
+                print_error(&format!("{:#}", err));
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Doctor { directory }) => {
+            let checks = doctor::run_checks(&directory).await;
+            print_checks(&checks);
+            // A non-zero exit lets a script tell "cbq is ready" from "cbq needs attention".
+            if checks.iter().any(|check| check.status == doctor::Status::Failed) {
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Status { directory }) => {
+            if let Err(err) = print_status(&directory) {
                 print_error(&format!("{:#}", err));
                 std::process::exit(1);
             }
@@ -489,41 +503,6 @@ fn stored_format_reason(conn: &rusqlite::Connection, model: &str) -> Result<Opti
         return Ok(Some("the embedding prefix for this model changed".to_string()));
     }
     Ok(None)
-}
-
-// Reading and hashing each file is independent work, so it runs across cores.
-fn read_source_files(
-    paths: &[PathBuf],
-    project_root: &Path,
-    allow_secrets: bool,
-) -> (Vec<SourceFile>, Vec<SkippedFile>) {
-    let read: Vec<Result<SourceFile, SkippedFile>> = paths
-        .par_iter()
-        .map(|path| {
-            let source_file = read_source_file(path, project_root).map_err(|err| SkippedFile {
-                path: path.clone(),
-                reason: SkipReason::Unreadable(err.to_string()),
-            })?;
-            // A credential pasted into a source file would otherwise be embedded and shown in answers.
-            match find_secret(&source_file.content) {
-                Some(secret) if !allow_secrets => Err(SkippedFile {
-                    path: path.clone(),
-                    reason: SkipReason::LooksLikeSecret(secret.to_string()),
-                }),
-                _ => Ok(source_file),
-            }
-        })
-        .collect();
-
-    let mut source_files = Vec::new();
-    let mut unreadable_files = Vec::new();
-    for outcome in read {
-        match outcome {
-            Ok(source_file) => source_files.push(source_file),
-            Err(skipped) => unreadable_files.push(skipped),
-        }
-    }
-    (source_files, unreadable_files)
 }
 
 // Files indexed this run record their own calls and imports; this covers the ones that didn't change.
@@ -907,6 +886,58 @@ fn print_graph_hint(conn: &rusqlite::Connection) -> Result<(), anyhow::Error> {
 
 fn first_line(content: &str) -> String {
     content.lines().map(str::trim).find(|line| !line.is_empty() && !line.starts_with("//")).unwrap_or("").to_string()
+}
+
+fn print_checks(checks: &[doctor::Check]) {
+    crate::ui::formatter::print_section("cbq doctor");
+    for check in checks {
+        let (mark, detail) = match check.status {
+            doctor::Status::Ok => ("✓".green().bold(), check.detail.normal()),
+            doctor::Status::Warning => ("⚠".yellow().bold(), check.detail.yellow()),
+            doctor::Status::Failed => ("✗".red().bold(), check.detail.red()),
+        };
+        println!("{} {:<22} {}", mark, check.name, detail);
+    }
+
+    let failures = checks.iter().filter(|check| check.status == doctor::Status::Failed).count();
+    let warnings = checks.iter().filter(|check| check.status == doctor::Status::Warning).count();
+    println!();
+    match (failures, warnings) {
+        (0, 0) => crate::ui::formatter::print_success_msg("Everything checks out."),
+        (0, _) => println!("{}", format!("{} worth looking at, nothing broken.", count_of("warning", warnings)).yellow()),
+        _ => println!("{}", format!("{} to fix.", count_of("problem", failures)).red().bold()),
+    }
+}
+
+fn print_status(directory: &Path) -> Result<(), anyhow::Error> {
+    let Some(summary) = doctor::summarise_index(directory)? else {
+        return Err(missing_index_error(directory));
+    };
+
+    crate::ui::formatter::print_section(&summary.project_root);
+    let is_stale = summary.is_stale();
+    let freshness = match is_stale {
+        true => format!(
+            "{} new, {} changed, {} removed",
+            summary.new_files, summary.changed_files, summary.removed_files
+        ),
+        false => "up to date".to_string(),
+    };
+    let rows = vec![
+        vec!["Indexed Files".to_string(), summary.indexed_files.to_string()],
+        vec!["Code Chunks".to_string(), summary.total_chunks.to_string()],
+        vec!["Languages".to_string(), format!("{} ({})", summary.languages.len(), summary.languages.join(", "))],
+        vec!["Embedding Model".to_string(), summary.embedding_model.unwrap_or_else(|| "unknown".to_string())],
+        vec!["Last Indexed".to_string(), summary.indexed_at.unwrap_or_else(|| "unknown".to_string())],
+        vec!["Against Disk".to_string(), freshness],
+        vec!["Disk Footprint".to_string(), format!("{:.1} MB", summary.size_bytes as f64 / 1024.0 / 1024.0)],
+    ];
+    crate::ui::formatter::print_table(&["Metric", "Value"], &rows);
+
+    if is_stale {
+        println!("\n{}", "Run `cbq index` to catch up with the files on disk.".dimmed());
+    }
+    Ok(())
 }
 
 fn list_indexes() -> Result<(), anyhow::Error> {

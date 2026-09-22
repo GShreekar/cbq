@@ -105,6 +105,26 @@ pub enum Commands {
         )]
         directory: PathBuf,
     },
+    #[command(about = "Check that cbq, Ollama and this project's index are all in working order")]
+    Doctor {
+        #[arg(
+            short = 'C',
+            long,
+            help = "Project directory to use instead of the current one",
+            default_value = "."
+        )]
+        directory: PathBuf,
+    },
+    #[command(about = "Summarise this project's index")]
+    Status {
+        #[arg(
+            short = 'C',
+            long,
+            help = "Project directory to use instead of the current one",
+            default_value = "."
+        )]
+        directory: PathBuf,
+    },
     #[command(about = "List the projects cbq has indexed")]
     List,
     #[command(about = "Delete this project's index, or every index")]

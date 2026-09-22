@@ -1,7 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use rayon::prelude::*;
+use crate::services::file_discovery::{SkipReason, SkippedFile};
 use crate::services::hashing::fnv1a_hash;
+use crate::services::secrets::find_secret;
 
 /// A project file read from disk, identified by its path relative to the project root.
 pub struct SourceFile {
@@ -36,6 +39,42 @@ pub fn read_source_file(absolute_path: &Path, project_root: &Path) -> Result<Sou
         content,
         content_hash,
     })
+}
+
+// Reading and hashing each file is independent work, so it runs across cores.
+/// Reads and hashes every file, leaving out any that hold credentials.
+pub fn read_source_files(
+    paths: &[PathBuf],
+    project_root: &Path,
+    allow_secrets: bool,
+) -> (Vec<SourceFile>, Vec<SkippedFile>) {
+    let read: Vec<Result<SourceFile, SkippedFile>> = paths
+        .par_iter()
+        .map(|path| {
+            let source_file = read_source_file(path, project_root).map_err(|err| SkippedFile {
+                path: path.clone(),
+                reason: SkipReason::Unreadable(err.to_string()),
+            })?;
+            // A credential pasted into a source file would otherwise be embedded and shown in answers.
+            match find_secret(&source_file.content) {
+                Some(secret) if !allow_secrets => Err(SkippedFile {
+                    path: path.clone(),
+                    reason: SkipReason::LooksLikeSecret(secret.to_string()),
+                }),
+                _ => Ok(source_file),
+            }
+        })
+        .collect();
+
+    let mut source_files = Vec::new();
+    let mut unreadable_files = Vec::new();
+    for outcome in read {
+        match outcome {
+            Ok(source_file) => source_files.push(source_file),
+            Err(skipped) => unreadable_files.push(skipped),
+        }
+    }
+    (source_files, unreadable_files)
 }
 
 /// Compares the files on disk with the content hashes recorded by the last index run.

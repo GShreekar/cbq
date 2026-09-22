@@ -21,6 +21,27 @@ No code is ever uploaded to the cloud—everything runs entirely on your local m
 
 ---
 
+## Checking everything works
+
+```bash
+cbq doctor     # config, Ollama, models, index, freshness, permissions
+cbq status     # what this project's index holds, and how far it has drifted from disk
+```
+
+`cbq doctor` reports each check as ✓, ⚠ or ✗, and exits non-zero if anything is broken, so it can gate
+a script. It is the fastest way to explain a surprising answer: a stale index, an embedding model that
+no longer matches the one the index was built with, a missing model, or a server that isn't reachable.
+
+```
+✓ Ollama server          reachable, 3 models installed
+✓ Index                  33 files, 514 chunks, 2.9 MB, built 2 minutes ago
+⚠ Index freshness        1 new, 4 changed, 0 removed since indexing; run `cbq index`
+✓ Embedding model match  index and config agree
+✓ Vector size match      768 dimensions
+```
+
+---
+
 ## What cbq stores, and where
 
 Indexes hold your source code, so `~/.cbq` and everything in it is created readable only by you

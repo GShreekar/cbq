@@ -102,6 +102,11 @@ impl ChunkVectors {
     pub fn is_empty(&self) -> bool {
         self.ids.is_empty()
     }
+
+    /// How many numbers each stored vector has, or None when the index is empty.
+    pub fn dimensions(&self) -> Option<usize> {
+        (!self.is_empty()).then_some(self.dimensions)
+    }
 }
 
 /// Reports whether a path looks like test code rather than the implementation.
