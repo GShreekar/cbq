@@ -9,9 +9,11 @@ on:
     - cron: "0 7 * * 1"
 
 # audit-check reports through a check run, which the default read-only token cannot create.
+# On the scheduled run it opens an issue per advisory instead, so it also needs issues: write.
 permissions:
   contents: read
   checks: write
+  issues: write
 
 jobs:
   audit:
